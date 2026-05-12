@@ -43,4 +43,14 @@ var (
 	addedLineStyle   = lipgloss.NewStyle().Foreground(colAdded)
 	removedLineStyle = lipgloss.NewStyle().Foreground(colRemoved)
 	gutterStyle      = lipgloss.NewStyle().Foreground(colMuted)
+
+	activeTabStyle = lipgloss.NewStyle().
+			Foreground(colBorderFocus).
+			Bold(true).
+			Underline(true)
+
+	inactiveTabStyle = lipgloss.NewStyle().
+				Foreground(colMuted)
+
+	tabSepStyle = lipgloss.NewStyle().Foreground(colBorder)
 )

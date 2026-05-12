@@ -48,8 +48,11 @@ func TestModelRenders(t *testing.T) {
 	if !strings.Contains(out, "main.go") {
 		t.Errorf("View missing file name. Got:\n%s", out)
 	}
-	if !strings.Contains(out, "Files (2)") {
-		t.Errorf("View missing file count header. Got:\n%s", out)
+	if !strings.Contains(out, "Files") {
+		t.Errorf("View missing Files tab. Got:\n%s", out)
+	}
+	if !strings.Contains(out, "2 files") {
+		t.Errorf("View missing file count subheader. Got:\n%s", out)
 	}
 }
 

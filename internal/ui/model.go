@@ -8,14 +8,14 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type pane int
 
 const (
-	paneFiles pane = iota
+	paneLeft pane = iota
 	paneDiff
-	paneComments
 )
 
 type viewMode int
@@ -47,7 +47,7 @@ func New(d *diff.Diff, commits []diff.Commit) Model {
 		commits:    commits,
 		commitDiff: map[string]*diff.Diff{},
 		commitErr:  map[string]error{},
-		focus:      paneFiles,
+		focus:      paneLeft,
 	}
 }
 
@@ -70,37 +70,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
-			m.focus = (m.focus + 1) % 3
+			m.focus = (m.focus + 1) % 2
 			return m, nil
 		case "shift+tab":
-			m.focus = (m.focus + 2) % 3
+			m.focus = (m.focus + 1) % 2
 			return m, nil
 		case "v":
 			m.toggleView()
 			return m, nil
+		case "1":
+			m.setView(viewChanges)
+			return m, nil
+		case "2":
+			m.setView(viewCommits)
+			return m, nil
 		case "j", "down":
-			if m.focus == paneFiles {
+			if m.focus == paneLeft {
 				m.moveCursor(+1)
 				return m, nil
 			}
 			m.viewport.ScrollDown(1)
 			return m, nil
 		case "k", "up":
-			if m.focus == paneFiles {
+			if m.focus == paneLeft {
 				m.moveCursor(-1)
 				return m, nil
 			}
 			m.viewport.ScrollUp(1)
 			return m, nil
 		case "g":
-			if m.focus == paneFiles {
+			if m.focus == paneLeft {
 				m.setCursor(0)
 			} else {
 				m.viewport.GotoTop()
 			}
 			return m, nil
 		case "G":
-			if m.focus == paneFiles {
+			if m.focus == paneLeft {
 				m.setCursor(m.maxCursor())
 			} else {
 				m.viewport.GotoBottom()
@@ -128,7 +134,6 @@ func (m Model) View() string {
 		lipgloss.Top,
 		m.renderLeftPane(),
 		m.renderDiffPane(),
-		m.renderRightPane(),
 	)
 	return lipgloss.JoinVertical(lipgloss.Left, body, m.renderHelp())
 }
@@ -137,14 +142,21 @@ func (m Model) View() string {
 
 func (m *Model) toggleView() {
 	if m.view == viewChanges {
-		if len(m.commits) == 0 {
-			m.statusMsg = "no commits to browse"
-			return
-		}
-		m.view = viewCommits
+		m.setView(viewCommits)
 	} else {
-		m.view = viewChanges
+		m.setView(viewChanges)
 	}
+}
+
+func (m *Model) setView(v viewMode) {
+	if v == viewCommits && len(m.commits) == 0 {
+		m.statusMsg = "no commits to browse"
+		return
+	}
+	if v == m.view {
+		return
+	}
+	m.view = v
 	m.statusMsg = ""
 	m.refreshDiff()
 }
@@ -194,9 +206,8 @@ func (m *Model) maxCursor() int {
 // --- layout ---
 
 const (
-	leftRatio   = 0.22
-	centerRatio = 0.53
-	helpHeight  = 1
+	leftRatio  = 0.28
+	helpHeight = 1
 )
 
 func (m *Model) layout() {
@@ -204,7 +215,8 @@ func (m *Model) layout() {
 		return
 	}
 	bodyH := m.height - helpHeight
-	centerW := int(float64(m.width) * centerRatio)
+	leftW := int(float64(m.width) * leftRatio)
+	centerW := m.width - leftW
 	innerW := centerW - 2
 	innerH := bodyH - 2 - 1
 
@@ -223,6 +235,9 @@ func (m *Model) refreshDiff() {
 		return
 	}
 	if m.view == viewChanges {
+		if m.fileCursor >= len(d.Files) {
+			m.fileCursor = 0
+		}
 		f := d.Files[m.fileCursor]
 		m.viewport.SetContent(renderDiff(f, m.viewport.Width))
 	} else {
@@ -231,8 +246,6 @@ func (m *Model) refreshDiff() {
 	m.viewport.GotoTop()
 }
 
-// currentDiff returns the diff being displayed for the current view. In commits view
-// this lazily loads (and caches) the diff for the selected commit.
 func (m *Model) currentDiff() *diff.Diff {
 	if m.view == viewChanges {
 		return m.d
@@ -258,10 +271,9 @@ func (m *Model) currentDiff() *diff.Diff {
 
 // --- panes ---
 
-func (m Model) paneWidths() (left, center, right int) {
+func (m Model) paneWidths() (left, center int) {
 	left = int(float64(m.width) * leftRatio)
-	center = int(float64(m.width) * centerRatio)
-	right = m.width - left - center
+	center = m.width - left
 	return
 }
 
@@ -274,25 +286,43 @@ func (m Model) paneStyleFor(p pane, w, h int) lipgloss.Style {
 }
 
 func (m Model) renderLeftPane() string {
-	leftW, _, _ := m.paneWidths()
+	leftW, _ := m.paneWidths()
 	bodyH := m.height - helpHeight
-	var content string
+
+	tabs := m.renderTabs(leftW - 4)
+	var listContent string
 	if m.view == viewCommits {
-		content = m.renderCommitsList(leftW)
+		listContent = m.renderCommitsList(leftW)
 	} else {
-		content = m.renderFilesList(leftW)
+		listContent = m.renderFilesList(leftW)
 	}
-	return m.paneStyleFor(paneFiles, leftW, bodyH).Render(content)
+	content := tabs + "\n" + listContent
+	return m.paneStyleFor(paneLeft, leftW, bodyH).Render(content)
+}
+
+func (m Model) renderTabs(maxW int) string {
+	style := func(active bool) lipgloss.Style {
+		if active {
+			return activeTabStyle
+		}
+		return inactiveTabStyle
+	}
+	filesTab := style(m.view == viewChanges).Render("Files")
+	commitsTab := style(m.view == viewCommits).Render("Commits")
+	row := filesTab + tabSepStyle.Render(" │ ") + commitsTab
+	return truncateAnsi(row, maxW)
 }
 
 func (m Model) renderFilesList(leftW int) string {
-	var lines []string
-	header := fmt.Sprintf("Files (%d)", len(m.d.Files))
-	if m.d.Label != "" {
-		header += " · " + m.d.Label
+	if m.d == nil || len(m.d.Files) == 0 {
+		return mutedStyle.Render("(no files)")
 	}
-	lines = append(lines, titleStyle.Render(truncateRaw(header, leftW-4)))
-
+	var lines []string
+	sub := fmt.Sprintf("%d files", len(m.d.Files))
+	if m.d.Label != "" {
+		sub = m.d.Label + " · " + sub
+	}
+	lines = append(lines, mutedStyle.Render(truncateRaw(sub, leftW-4)))
 	for i, f := range m.d.Files {
 		marker := statusMarker(f.Status)
 		name := compactPath(f.Path, leftW-6)
@@ -306,15 +336,18 @@ func (m Model) renderFilesList(leftW int) string {
 }
 
 func (m Model) renderCommitsList(leftW int) string {
+	if len(m.commits) == 0 {
+		return mutedStyle.Render("(no commits)")
+	}
 	var lines []string
-	header := fmt.Sprintf("Commits (%d)", len(m.commits))
-	lines = append(lines, titleStyle.Render(header))
-
+	lines = append(lines, mutedStyle.Render(fmt.Sprintf("%d commits", len(m.commits))))
 	for i, c := range m.commits {
 		summary := compactPath(c.Subject, leftW-12)
-		row := fmt.Sprintf("%s %s", mutedStyle.Render(c.ShortSHA), summary)
+		var row string
 		if i == m.commitCursor {
 			row = cursorStyle.Render(fmt.Sprintf("%s %s", c.ShortSHA, summary))
+		} else {
+			row = fmt.Sprintf("%s %s", mutedStyle.Render(c.ShortSHA), summary)
 		}
 		lines = append(lines, row)
 	}
@@ -322,25 +355,12 @@ func (m Model) renderCommitsList(leftW int) string {
 }
 
 func (m Model) renderDiffPane() string {
-	_, centerW, _ := m.paneWidths()
+	_, centerW := m.paneWidths()
 	bodyH := m.height - helpHeight
 	header := titleStyle.Render(m.diffTitle())
 	body := m.viewport.View()
 	content := header + "\n" + body
 	return m.paneStyleFor(paneDiff, centerW, bodyH).Render(content)
-}
-
-func (m Model) renderRightPane() string {
-	_, _, rightW := m.paneWidths()
-	bodyH := m.height - helpHeight
-	var content string
-	if m.view == viewCommits && len(m.commits) > 0 {
-		c := m.commits[m.commitCursor]
-		content = renderCommitMeta(c, rightW-4)
-	} else {
-		content = titleStyle.Render("Comments") + "\n\n" + mutedStyle.Render("(no draft yet — Claude pending)")
-	}
-	return m.paneStyleFor(paneComments, rightW, bodyH).Render(content)
 }
 
 func (m Model) diffTitle() string {
@@ -358,8 +378,6 @@ func (m Model) diffTitle() string {
 	return f.Path
 }
 
-// currentDiffReadonly returns the cached diff without triggering a load. Used by render code
-// that runs after refreshDiff has populated the viewport.
 func (m Model) currentDiffReadonly() *diff.Diff {
 	if m.view == viewChanges {
 		return m.d
@@ -371,7 +389,7 @@ func (m Model) currentDiffReadonly() *diff.Diff {
 }
 
 func (m Model) renderHelp() string {
-	parts := []string{"j/k: nav", "J/K or ctrl+d/u: scroll", "tab: focus", "v: changes/commits", "q: quit"}
+	parts := []string{"j/k: nav", "J/K or ctrl+d/u: scroll", "tab: focus", "1/2 or v: switch tab", "q: quit"}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {
 		hint = mutedStyle.Render(m.statusMsg) + "  ·  " + hint
@@ -412,33 +430,14 @@ func truncateRaw(s string, maxW int) string {
 	return s[:maxW-1] + "…"
 }
 
-func renderCommitMeta(c diff.Commit, maxW int) string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render(c.ShortSHA))
-	b.WriteString("\n")
-	b.WriteString(c.Subject)
-	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render(fmt.Sprintf("%s <%s>", c.Author, c.Email)))
-	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render(c.RelDate + " · " + c.IsoDate))
-	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render("parents: "))
-	if c.IsRoot() {
-		b.WriteString(mutedStyle.Render("(root)"))
-	} else {
-		shortParents := make([]string, len(c.Parents))
-		for i, p := range c.Parents {
-			if len(p) > 7 {
-				shortParents[i] = p[:7]
-			} else {
-				shortParents[i] = p
-			}
-		}
-		b.WriteString(strings.Join(shortParents, " "))
+// truncateAnsi cuts a string with embedded ANSI escapes to maxW visible columns,
+// preserving the escapes so styles never bleed into following lines.
+func truncateAnsi(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
 	}
-	if c.Body != "" {
-		b.WriteString("\n\n")
-		b.WriteString(c.Body)
+	if ansi.StringWidth(s) <= maxW {
+		return s
 	}
-	return b.String()
+	return ansi.Truncate(s, maxW, "…")
 }
