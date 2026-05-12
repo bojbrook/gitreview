@@ -174,6 +174,15 @@ func resolveBaseRef(baseRef string) (string, error) {
 		"Use --base <ref> to pick one, or --working / --staged to skip comparing against a base")
 }
 
+// RepoRoot returns the absolute path of the current repo's working tree.
+func RepoRoot() (string, error) {
+	out, err := run("git", "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 func revExists(ref string) bool {
 	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref)
 	return cmd.Run() == nil

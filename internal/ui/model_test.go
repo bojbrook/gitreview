@@ -37,7 +37,7 @@ func fakeDiff() *diff.Diff {
 }
 
 func TestModelRenders(t *testing.T) {
-	m := New(fakeDiff(), nil)
+	m := New(fakeDiff(), nil, "")
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -57,7 +57,7 @@ func TestModelRenders(t *testing.T) {
 }
 
 func TestModelNavigation(t *testing.T) {
-	m := New(fakeDiff(), nil)
+	m := New(fakeDiff(), nil, "")
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 

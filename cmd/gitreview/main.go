@@ -42,7 +42,12 @@ func main() {
 		return
 	}
 
-	p := tea.NewProgram(ui.New(d, commits), tea.WithAltScreen())
+	repoRoot, err := diff.RepoRoot()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gitreview: warn: could not resolve repo root:", err)
+	}
+
+	p := tea.NewProgram(ui.New(d, commits, repoRoot), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "gitreview:", err)
 		os.Exit(1)

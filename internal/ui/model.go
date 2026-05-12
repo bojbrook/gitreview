@@ -30,6 +30,7 @@ type Model struct {
 	commits      []diff.Commit
 	commitDiff   map[string]*diff.Diff
 	commitErr    map[string]error
+	repoRoot     string
 	view         viewMode
 	fileCursor   int
 	commitCursor int
@@ -41,15 +42,19 @@ type Model struct {
 	statusMsg    string
 }
 
-func New(d *diff.Diff, commits []diff.Commit) Model {
+func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
 	return Model{
 		d:          d,
 		commits:    commits,
 		commitDiff: map[string]*diff.Diff{},
 		commitErr:  map[string]error{},
+		repoRoot:   repoRoot,
 		focus:      paneLeft,
 	}
 }
+
+// editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
+type editorDoneMsg struct{ err error }
 
 func (m Model) Init() tea.Cmd {
 	return nil
@@ -118,12 +123,83 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+u":
 			m.viewport.HalfPageUp()
 			return m, nil
+		case "e":
+			return m, m.openInEditor()
 		}
+
+	case editorDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = "editor: " + msg.err.Error()
+		} else {
+			m.statusMsg = "edit done — quit and re-run to refresh"
+		}
+		return m, nil
 	}
 
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
+}
+
+// openInEditor launches $EDITOR on the currently selected file at its first
+// hunk's new-side line. Returns nil (no-op) if there's no editable file.
+func (m *Model) openInEditor() tea.Cmd {
+	f, line, ok := m.selectedEditTarget()
+	if !ok {
+		m.statusMsg = "nothing to edit here"
+		return nil
+	}
+	if m.repoRoot == "" {
+		m.statusMsg = "no repo root"
+		return nil
+	}
+	abs := m.repoRoot + "/" + f.Path
+	cmd := editorCmd(abs, line)
+	if cmd == nil {
+		m.statusMsg = "no editor found (set $EDITOR)"
+		return nil
+	}
+	m.statusMsg = ""
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return editorDoneMsg{err: err}
+	})
+}
+
+// selectedEditTarget returns the file and line to jump to in the editor.
+// Picks the first hunk's first added/context line (new side). Returns ok=false
+// for deleted files or when no file is selected.
+func (m *Model) selectedEditTarget() (diff.File, int, bool) {
+	d := m.currentDiffReadonly()
+	if d == nil || len(d.Files) == 0 {
+		return diff.File{}, 0, false
+	}
+	var f diff.File
+	if m.view == viewCommits {
+		// In commits view there's no file cursor — open the first file of the commit's diff.
+		f = d.Files[0]
+	} else {
+		if m.fileCursor >= len(d.Files) {
+			return diff.File{}, 0, false
+		}
+		f = d.Files[m.fileCursor]
+	}
+	if f.Status == diff.StatusDeleted {
+		return diff.File{}, 0, false
+	}
+	line := 1
+	if len(f.Hunks) > 0 {
+		h := f.Hunks[0]
+		if h.NewStart > 0 {
+			line = h.NewStart
+		}
+		for _, l := range h.Lines {
+			if l.Kind == diff.LineAdded && l.NewNum > 0 {
+				line = l.NewNum
+				break
+			}
+		}
+	}
+	return f, line, true
 }
 
 func (m Model) View() string {
@@ -389,7 +465,7 @@ func (m Model) currentDiffReadonly() *diff.Diff {
 }
 
 func (m Model) renderHelp() string {
-	parts := []string{"j/k: nav", "J/K or ctrl+d/u: scroll", "tab: focus", "1/2 or v: switch tab", "q: quit"}
+	parts := []string{"j/k: nav", "scroll: J/K", "tab: focus", "1/2 or v: switch tab", "e: edit", "q: quit"}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {
 		hint = mutedStyle.Render(m.statusMsg) + "  ·  " + hint
