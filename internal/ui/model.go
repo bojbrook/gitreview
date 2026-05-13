@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
+	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -19,6 +21,7 @@ type pane int
 const (
 	paneLeft pane = iota
 	paneDiff
+	paneContext
 )
 
 type viewMode int
@@ -42,6 +45,11 @@ type Model struct {
 	overviewCols   int // computed at render time so j/k can move by row
 	focus          pane
 	splitView      bool
+	contextPaneVisible bool          // user-toggled; default true
+	contextPayload     ctxpane.Payload
+	contextCursor      ctxpane.Cursor
+	contextSelected    int           // currently highlighted item index when pane is focused
+	contextRefreshSeq  int           // monotonic; used to ignore stale debounced ticks
 	hunkOffsets    []int // viewport line indices of each hunk in the current file
 	width        int
 	height       int
@@ -74,14 +82,15 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
 	ti.Placeholder = "filter files…"
 	ti.CharLimit = 100
 	return Model{
-		d:             d,
-		commits:       commits,
-		commitDiff:    map[string]*diff.Diff{},
-		commitErr:     map[string]error{},
-		repoRoot:      repoRoot,
-		focus:         paneLeft,
-		filterInput:   ti,
-		reviewedFiles: map[string]bool{},
+		d:                  d,
+		commits:            commits,
+		commitDiff:         map[string]*diff.Diff{},
+		commitErr:          map[string]error{},
+		repoRoot:           repoRoot,
+		focus:              paneLeft,
+		filterInput:        ti,
+		reviewedFiles:      map[string]bool{},
+		contextPaneVisible: true,
 	}
 }
 
@@ -218,7 +227,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			if m.filter != "" {
 				m.clearFilter()
+				return m, nil
 			}
+			m.contextPaneVisible = !m.contextPaneVisible
+			if !m.contextPaneVisible && m.focus == paneContext {
+				m.focus = paneDiff
+			}
+			m.layout()
+			m.refreshDiff()
 			return m, nil
 		case "m":
 			m.toggleReviewed()
@@ -323,11 +339,11 @@ func (m Model) View() string {
 	if m.view == viewOverview {
 		body = m.renderOverviewBody()
 	} else {
-		body = lipgloss.JoinHorizontal(
-			lipgloss.Top,
-			m.renderLeftPane(),
-			m.renderDiffPane(),
-		)
+		parts := []string{m.renderLeftPane(), m.renderDiffPane()}
+		if m.contextPaneWidthEffective() > 0 {
+			parts = append(parts, m.renderContextPane())
+		}
+		body = lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderHelp())
 }
@@ -406,6 +422,11 @@ func (m Model) overviewColsAtWidth() int {
 const (
 	headerRows = 1
 	spineColW  = 2 // 1 col spine + 1 col gap inside the diff pane
+)
+
+const (
+	contextPaneWidth   = 32  // fixed width when visible
+	contextPaneMinTerm = 120 // hide entirely below this terminal width
 )
 
 // --- filter ---
@@ -695,7 +716,8 @@ func (m *Model) layout() {
 	}
 	bodyH := m.height - headerRows - helpHeight
 	leftW := int(float64(m.width) * leftRatio)
-	centerW := m.width - leftW
+	contextW := m.contextPaneWidthEffective()
+	centerW := m.width - leftW - contextW
 	// Reserve 2 cols on the right of the diff pane for the file-spine column
 	// (1 col spine + 1 col gap). Empty in commits view but keeps layout stable.
 	innerW := centerW - 4 - spineColW
@@ -707,6 +729,22 @@ func (m *Model) layout() {
 		m.viewport.Width = innerW
 		m.viewport.Height = innerH
 	}
+}
+
+// contextPaneWidthEffective returns 0 when the pane is hidden (user toggled it
+// off, split view forces it off, or terminal too narrow); otherwise the fixed
+// pane width.
+func (m Model) contextPaneWidthEffective() int {
+	if !m.contextPaneVisible {
+		return 0
+	}
+	if m.splitView {
+		return 0
+	}
+	if m.width < contextPaneMinTerm {
+		return 0
+	}
+	return contextPaneWidth
 }
 
 func (m *Model) refreshDiff() {
@@ -743,6 +781,13 @@ func (m *Model) refreshDiff() {
 		m.viewport.SetContent(renderFullDiff(d.Files, m.viewport.Width))
 		m.hunkOffsets = nil
 	}
+	m.contextPayload = ctxpane.Resolve(context.Background(), ctxpane.Cursor{
+		File:      m.currentFileForContext(),
+		HunkIndex: m.currentHunkIndex(),
+		Diff:      m.d,
+		RepoRoot:  m.repoRoot,
+	})
+	m.contextSelected = 0
 	m.viewport.GotoTop()
 }
 
@@ -771,9 +816,10 @@ func (m *Model) currentDiff() *diff.Diff {
 
 // --- panes ---
 
-func (m Model) paneWidths() (left, center int) {
+func (m Model) paneWidths() (left, center, context int) {
 	left = int(float64(m.width) * leftRatio)
-	center = m.width - left
+	context = m.contextPaneWidthEffective()
+	center = m.width - left - context
 	return
 }
 
@@ -786,7 +832,7 @@ func (m Model) paneStyleFor(p pane, w, h int) lipgloss.Style {
 }
 
 func (m Model) renderLeftPane() string {
-	leftW, _ := m.paneWidths()
+	leftW, _, _ := m.paneWidths()
 	bodyH := m.height - headerRows - helpHeight
 
 	var listContent string
@@ -915,7 +961,7 @@ func (m Model) renderCommitsList(leftW int) string {
 }
 
 func (m Model) renderDiffPane() string {
-	_, centerW := m.paneWidths()
+	_, centerW, _ := m.paneWidths()
 	bodyH := m.height - headerRows - helpHeight
 	header := titleStyle.Render(m.diffTitle())
 	body := m.attachSpineColumn(m.viewport.View())
@@ -981,6 +1027,19 @@ func (m Model) currentHunkIndex() int {
 		active = i
 	}
 	return active
+}
+
+// currentFileForContext returns the file the context pane should describe,
+// or a zero-value File if no file is selected.
+func (m Model) currentFileForContext() diff.File {
+	if m.view != viewChanges {
+		return diff.File{}
+	}
+	files, _ := m.effectiveFiles()
+	if m.fileCursor < 0 || m.fileCursor >= len(files) {
+		return diff.File{}
+	}
+	return files[m.fileCursor]
 }
 
 func (m Model) diffTitle() string {

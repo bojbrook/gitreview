@@ -82,3 +82,59 @@ func TestModelNavigation(t *testing.T) {
 		t.Errorf("focus after tab: got %v want paneDiff", m.focus)
 	}
 }
+
+func TestContextPaneVisibleByDefault(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if !m.contextPaneVisible {
+		t.Error("contextPaneVisible: got false want true")
+	}
+	if m.contextPaneWidthEffective() == 0 {
+		t.Error("contextPaneWidthEffective: got 0 at width=140")
+	}
+	if !strings.Contains(m.View(), "Where") {
+		t.Errorf("View missing context section. Got:\n%s", m.View())
+	}
+}
+
+func TestContextPaneHiddenBelow120Cols(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	if m.contextPaneWidthEffective() != 0 {
+		t.Errorf("contextPaneWidthEffective at 100 cols: got %d want 0", m.contextPaneWidthEffective())
+	}
+}
+
+func TestContextPaneToggleWithC(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if !m.contextPaneVisible {
+		t.Error("initial: pane should be visible")
+	}
+	// Toggle off with c
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(Model)
+	if m.contextPaneVisible {
+		t.Error("after first c: pane should be hidden")
+	}
+	// Toggle back on with c
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(Model)
+	if !m.contextPaneVisible {
+		t.Error("after second c: pane should be visible again")
+	}
+}
+
+func TestContextPaneHiddenInSplitView(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if m.contextPaneWidthEffective() != 0 {
+		t.Error("split view should hide context pane")
+	}
+}

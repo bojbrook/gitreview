@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -681,4 +682,55 @@ func padBetweenAnsi(left, right string, width int) string {
 		return left
 	}
 	return left + strings.Repeat(" ", width-lw-rw) + right
+}
+
+// renderContextPane builds the third column. When the pane is hidden (via
+// contextPaneWidthEffective returning 0) the caller should skip it entirely.
+func (m Model) renderContextPane() string {
+	_, _, contextW := m.paneWidths()
+	bodyH := m.height - headerRows - helpHeight
+	innerW := contextW - 4 // borders (2) + horizontal padding (2)
+	if innerW < 8 {
+		innerW = 8
+	}
+
+	style := contextPaneStyle
+	if m.focus == paneContext {
+		style = contextPaneFocusStyle
+	}
+
+	var lines []string
+	if len(m.contextPayload.Sections) == 0 {
+		lines = append(lines, contextMutedStyle.Render("(no context)"))
+	}
+	idx := 0
+	for _, s := range m.contextPayload.Sections {
+		if s.Status == ctxpane.StatusEmpty || (len(s.Items) == 0 && s.Status != ctxpane.StatusLoading && s.Status != ctxpane.StatusError) {
+			continue
+		}
+		if len(lines) > 0 {
+			lines = append(lines, "") // blank separator between sections
+		}
+		lines = append(lines, contextSectionHeaderStyle.Render("▸ "+s.Kind.Title()))
+		switch s.Status {
+		case ctxpane.StatusLoading:
+			lines = append(lines, contextMutedStyle.Render("  …"))
+			idx++
+		case ctxpane.StatusError:
+			lines = append(lines, contextMutedStyle.Render("  (error)"))
+			idx++
+		default:
+			for _, it := range s.Items {
+				row := "  " + truncateRaw(it.Text, innerW-2)
+				if m.focus == paneContext && idx == m.contextSelected {
+					row = contextItemSelectedStyle.Render(row)
+				} else {
+					row = contextItemStyle.Render(row)
+				}
+				lines = append(lines, row)
+				idx++
+			}
+		}
+	}
+	return style.Width(contextW - 2).Height(bodyH - 2).Render(strings.Join(lines, "\n"))
 }
