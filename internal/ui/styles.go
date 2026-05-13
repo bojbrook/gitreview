@@ -45,6 +45,11 @@ var (
 	removedLineStyle = lipgloss.NewStyle().Foreground(colRemoved)
 	gutterStyle      = lipgloss.NewStyle().Foreground(colMuted)
 
+	// beforeBodyStyle is the uniform tint applied to the BEFORE (removed/old)
+	// content. Dimmer red so it visually recedes vs. the syntax-highlighted
+	// AFTER (new) content.
+	beforeBodyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("167"))
+
 	activeTabStyle = lipgloss.NewStyle().
 			Foreground(colBorderFocus).
 			Bold(true).

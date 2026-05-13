@@ -387,37 +387,51 @@ func renderDiff(f diff.File, width int) string {
 		b.WriteString("\n")
 
 		for _, line := range h.Lines {
-			b.WriteString(renderLine(line, width))
+			b.WriteString(renderLine(line, f.Language, width))
 			b.WriteString("\n")
 		}
 	}
 	return b.String()
 }
 
-func renderLine(l diff.Line, width int) string {
+func renderLine(l diff.Line, lang string, width int) string {
 	old := pad(l.OldNum)
 	new := pad(l.NewNum)
 	content := expandTabs(l.Content, 4)
-	var sign string
-	var styled string
 
+	var body, sign string
 	switch l.Kind {
 	case diff.LineAdded:
 		old = "    "
-		sign = "+"
-		styled = addedLineStyle.Render(sign + " " + content)
+		sign = addedLineStyle.Render("+ ")
+		body = highlightCode(content, lang)
 	case diff.LineRemoved:
 		new = "    "
-		sign = "-"
-		styled = removedLineStyle.Render(sign + " " + content)
+		sign = removedLineStyle.Render("- ")
+		// Uniform "before" tint — no chroma so the removed line visually recedes.
+		body = beforeBodyStyle.Render(content)
 	default:
-		sign = " "
-		styled = "  " + content
+		sign = "  "
+		body = highlightCode(content, lang)
 	}
 
+	accent := lineAccent(l.Kind)
 	gutter := gutterStyle.Render(fmt.Sprintf("%s %s ", old, new))
-	combined := gutter + styled
-	return truncate(combined, width)
+	return truncate(accent+gutter+sign+body, width)
+}
+
+// lineAccent returns a 1-col vertical bar tinted by line kind. Green for adds,
+// red for removes, blank for context. The visible signal that survives even
+// when chroma is applying its own foreground colors to the line body.
+func lineAccent(k diff.LineKind) string {
+	switch k {
+	case diff.LineAdded:
+		return addedLineStyle.Render("▎")
+	case diff.LineRemoved:
+		return removedLineStyle.Render("▎")
+	default:
+		return " "
+	}
 }
 
 // splitDivider is the BEFORE/AFTER column separator. Three visible cells —
@@ -463,7 +477,7 @@ func renderSplit(f diff.File, width int) string {
 
 		rows := pairHunkLines(h)
 		for _, sr := range rows {
-			b.WriteString(renderSplitRow(sr, colW))
+			b.WriteString(renderSplitRow(sr, f.Language, colW))
 			b.WriteString("\n")
 		}
 	}
@@ -541,14 +555,17 @@ func pairHunkLines(h diff.Hunk) []splitRow {
 	return rows
 }
 
-func renderSplitRow(sr splitRow, colW int) string {
-	left := renderSplitSide(sr.leftNum, sr.leftText, sr.leftKind, colW)
-	right := renderSplitSide(sr.rightNum, sr.rightText, sr.rightKind, colW)
+func renderSplitRow(sr splitRow, lang string, colW int) string {
+	left := renderSplitSide(sr.leftNum, sr.leftText, sr.leftKind, lang, colW, true)
+	right := renderSplitSide(sr.rightNum, sr.rightText, sr.rightKind, lang, colW, false)
 	return left + splitDivider + right
 }
 
-func renderSplitSide(num int, text string, kind diff.LineKind, colW int) string {
-	textW := colW - 5 // 4 line-num + 1 space
+// renderSplitSide renders one column of the split view. isBefore=true tints the
+// whole body with beforeBodyStyle (uniform dim red, no syntax highlighting) so
+// the OLD version is visually distinct from the syntax-highlighted NEW one.
+func renderSplitSide(num int, text string, kind diff.LineKind, lang string, colW int, isBefore bool) string {
+	textW := colW - 6 // accent (1) + numStr (4) + space (1) + body
 	if textW < 1 {
 		textW = 1
 	}
@@ -556,23 +573,32 @@ func renderSplitSide(num int, text string, kind diff.LineKind, colW int) string 
 		return strings.Repeat(" ", colW)
 	}
 	numStr := pad(num)
-	// Tabs are 1 byte but render as multiple columns. Expand before measuring
-	// width so truncation/padding stays aligned with what the terminal draws.
-	body := expandTabs(text, 4)
-	if len(body) > textW {
-		body = body[:textW]
-	}
-	body += strings.Repeat(" ", textW-len(body))
+	expanded := expandTabs(text, 4)
 
-	gutter := gutterStyle.Render(numStr + " ")
-	switch kind {
-	case diff.LineAdded:
-		return gutter + addedLineStyle.Render(body)
-	case diff.LineRemoved:
-		return gutter + removedLineStyle.Render(body)
-	default:
-		return gutter + body
+	var body string
+	if isBefore {
+		// Plain text first — width is byte count for ASCII.
+		clipped := expanded
+		if len(clipped) > textW {
+			clipped = clipped[:textW]
+		}
+		clipped += strings.Repeat(" ", textW-len(clipped))
+		body = beforeBodyStyle.Render(clipped)
+	} else {
+		styled := highlightCode(expanded, lang)
+		if ansi.StringWidth(styled) > textW {
+			styled = ansi.Truncate(styled, textW, "")
+		}
+		padN := textW - ansi.StringWidth(styled)
+		if padN > 0 {
+			styled += strings.Repeat(" ", padN)
+		}
+		body = styled
 	}
+
+	accent := lineAccent(kind)
+	gutter := gutterStyle.Render(numStr + " ")
+	return accent + gutter + body
 }
 
 // expandTabs replaces \t characters with the right number of spaces to reach
