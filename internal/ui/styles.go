@@ -58,6 +58,10 @@ var (
 	// spineLabelStyle is the small bold file name above each overview spine cell.
 	spineLabelStyle = lipgloss.NewStyle().Bold(true)
 
+	// cursorBarStyle is the bright accent used for spine markers indicating
+	// the currently-focused hunk.
+	cursorBarStyle = lipgloss.NewStyle().Foreground(colCursor).Bold(true)
+
 	// splitDividerStyle is the BEFORE/AFTER divider in split view — bright + bold
 	// so it reads as a hard boundary, not a subtle separator.
 	splitDividerStyle = lipgloss.NewStyle().

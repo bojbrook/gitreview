@@ -221,6 +221,112 @@ func spineCell(b spineBucket, maxD, w int) string {
 	}
 }
 
+// renderSparkline returns a short horizontal histogram of where changes cluster
+// along a file's length. Each cell is one of `░▒▓█` (or `·` if empty), tinted
+// green/red/orange by net direction. Used inline next to file paths.
+func renderSparkline(f diff.File, width int) string {
+	if width < 1 {
+		return ""
+	}
+	buckets := computeSpine(f, width) // reuse the spine math, projected horizontally
+	maxD := 0
+	for _, b := range buckets {
+		d := b.added + b.removed
+		if d > maxD {
+			maxD = d
+		}
+	}
+	var b strings.Builder
+	for _, bk := range buckets {
+		b.WriteString(spineCell(bk, maxD, 1))
+	}
+	return b.String()
+}
+
+// renderFileSpine returns a vertical bar of `height` rows for a file's full
+// extent. activeHunkIx (or -1) gets a bright marker; other hunk-rows are
+// faintly dotted; non-hunk rows are blank. Suitable for placement on the right
+// edge of the diff pane.
+func renderFileSpine(f diff.File, height int, activeHunkIx int) []string {
+	if height < 1 || len(f.Hunks) == 0 {
+		return nil
+	}
+	length := fileLength(f)
+	if length < 1 {
+		length = 1
+	}
+
+	hunkRows := make(map[int]bool)
+	activeRow := -1
+	for i, h := range f.Hunks {
+		n := h.NewStart
+		if n == 0 {
+			n = h.OldStart
+		}
+		if n < 1 {
+			n = 1
+		}
+		row := (n - 1) * height / length
+		if row >= height {
+			row = height - 1
+		}
+		hunkRows[row] = true
+		if i == activeHunkIx {
+			activeRow = row
+		}
+	}
+
+	out := make([]string, height)
+	for i := 0; i < height; i++ {
+		switch {
+		case i == activeRow:
+			out[i] = cursorBarStyle.Render("◀")
+		case hunkRows[i]:
+			out[i] = mutedStyle.Render("·")
+		default:
+			out[i] = " "
+		}
+	}
+	return out
+}
+
+// renderSparklinePlain is like renderSparkline but without any color/ANSI
+// escapes. Suitable for inclusion inside a cursorStyle.Render(...) row whose
+// background fill mustn't be interrupted.
+func renderSparklinePlain(f diff.File, width int) string {
+	if width < 1 {
+		return ""
+	}
+	buckets := computeSpine(f, width)
+	maxD := 0
+	for _, b := range buckets {
+		d := b.added + b.removed
+		if d > maxD {
+			maxD = d
+		}
+	}
+	var b strings.Builder
+	for _, bk := range buckets {
+		total := bk.added + bk.removed
+		if total == 0 || maxD == 0 {
+			b.WriteRune('·')
+			continue
+		}
+		ratio := float64(total) / float64(maxD)
+		switch {
+		case ratio < 0.25:
+			b.WriteRune('░')
+		case ratio < 0.5:
+			b.WriteRune('▒')
+		case ratio < 0.75:
+			b.WriteRune('▓')
+		default:
+			b.WriteRune('█')
+		}
+	}
+	return b.String()
+}
+
 // hunkOffsetsUnified returns the viewport line index of each hunk header in
 // the output of renderDiff(f, _). One entry per hunk.
 func hunkOffsetsUnified(f diff.File) []int {

@@ -384,7 +384,10 @@ func (m Model) overviewColsAtWidth() int {
 	return cols
 }
 
-const headerRows = 1
+const (
+	headerRows = 1
+	spineColW  = 2 // 1 col spine + 1 col gap inside the diff pane
+)
 
 // --- filter ---
 
@@ -602,7 +605,9 @@ func (m *Model) layout() {
 	bodyH := m.height - headerRows - helpHeight
 	leftW := int(float64(m.width) * leftRatio)
 	centerW := m.width - leftW
-	innerW := centerW - 4 // borders (2) + horizontal padding (2)
+	// Reserve 2 cols on the right of the diff pane for the file-spine column
+	// (1 col spine + 1 col gap). Empty in commits view but keeps layout stable.
+	innerW := centerW - 4 - spineColW
 	innerH := bodyH - 2 - 1
 
 	if !m.ready {
@@ -730,9 +735,17 @@ func (m Model) renderFilesList(leftW int) string {
 		return strings.Join(lines, "\n")
 	}
 
+	const sparkW = 6
+	showSpark := rowW >= 30 // only if there's enough room for path + sparkline + stats
+
 	for i, f := range files {
 		statsPlain := formatFileStats(f)
-		pathMaxW := rowW - 3 - len(statsPlain)
+		// Reserve: "M " (2) + spaces (≥1) + stats. Add sparkline + 2 spaces if shown.
+		reserve := 3 + len(statsPlain)
+		if showSpark {
+			reserve += sparkW + 2
+		}
+		pathMaxW := rowW - reserve
 		if pathMaxW < 4 {
 			pathMaxW = 4
 		}
@@ -740,13 +753,23 @@ func (m Model) renderFilesList(leftW int) string {
 
 		if i == m.fileCursor {
 			plainLeft := fmt.Sprintf("%s %s", f.Status, name)
-			row := padBetweenPlain(plainLeft, statsPlain, rowW)
-			lines = append(lines, cursorStyle.Render(row))
+			if showSpark {
+				right := renderSparklinePlain(f, sparkW) + "  " + statsPlain
+				lines = append(lines, cursorStyle.Render(padBetweenAnsi(plainLeft, right, rowW)))
+			} else {
+				row := padBetweenPlain(plainLeft, statsPlain, rowW)
+				lines = append(lines, cursorStyle.Render(row))
+			}
 		} else {
 			coloredLeft := fmt.Sprintf("%s %s", statusMarker(f.Status), name)
 			coloredStats := mutedStyle.Render(statsPlain)
-			row := padBetweenAnsi(coloredLeft, coloredStats, rowW)
-			lines = append(lines, row)
+			if showSpark {
+				right := renderSparkline(f, sparkW) + "  " + coloredStats
+				lines = append(lines, padBetweenAnsi(coloredLeft, right, rowW))
+			} else {
+				row := padBetweenAnsi(coloredLeft, coloredStats, rowW)
+				lines = append(lines, row)
+			}
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -782,9 +805,69 @@ func (m Model) renderDiffPane() string {
 	_, centerW := m.paneWidths()
 	bodyH := m.height - headerRows - helpHeight
 	header := titleStyle.Render(m.diffTitle())
-	body := m.viewport.View()
+	body := m.attachSpineColumn(m.viewport.View())
 	content := header + "\n" + body
 	return m.paneStyleFor(paneDiff, centerW, bodyH).Render(content)
+}
+
+// attachSpineColumn glues a 1-col file-spine bar to the right edge of the
+// viewport content (with a 1-col gap). Only meaningful in viewChanges; in
+// other views the reserved cols stay blank so layout doesn't jump.
+func (m Model) attachSpineColumn(body string) string {
+	if m.view != viewChanges {
+		// Pad blank cols so the pane still consumes the same width.
+		gap := strings.Repeat(" ", spineColW)
+		var b strings.Builder
+		for i, line := range strings.Split(body, "\n") {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(line)
+			b.WriteString(gap)
+		}
+		return b.String()
+	}
+	files, _ := m.effectiveFiles()
+	if len(files) == 0 || m.fileCursor >= len(files) {
+		return body
+	}
+	f := files[m.fileCursor]
+	spineRows := renderFileSpine(f, m.viewport.Height, m.currentHunkIndex())
+	if len(spineRows) == 0 {
+		return body
+	}
+	lines := strings.Split(body, "\n")
+	var b strings.Builder
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(line)
+		b.WriteString(" ")
+		if i < len(spineRows) {
+			b.WriteString(spineRows[i])
+		} else {
+			b.WriteString(" ")
+		}
+	}
+	return b.String()
+}
+
+// currentHunkIndex returns the index of the hunk whose offset is just at or
+// above the viewport's current YOffset, or -1 if no hunks.
+func (m Model) currentHunkIndex() int {
+	if len(m.hunkOffsets) == 0 {
+		return -1
+	}
+	cur := m.viewport.YOffset
+	active := 0
+	for i, off := range m.hunkOffsets {
+		if off > cur {
+			break
+		}
+		active = i
+	}
+	return active
 }
 
 func (m Model) diffTitle() string {
