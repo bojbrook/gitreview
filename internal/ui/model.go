@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
@@ -97,6 +98,19 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
 // editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
 type editorDoneMsg struct{ err error }
 
+// contextRefreshMsg is fired by tea.Tick after the debounce window. The Seq
+// must match the model's current contextRefreshSeq, otherwise the tick is
+// stale (a newer move has scheduled a fresher one) and we no-op.
+type contextRefreshMsg struct{ Seq int }
+
+// contextResultMsg carries the computed payload back from the resolver Cmd.
+type contextResultMsg struct {
+	Seq     int
+	Payload ctxpane.Payload
+}
+
+const contextDebounce = 150 * time.Millisecond
+
 func (m Model) Init() tea.Cmd {
 	return nil
 }
@@ -124,7 +138,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.layout()
 		m.refreshDiff()
 		m.ready = true
-		return m, nil
+		return m, m.scheduleContextRefresh()
 
 	case tea.KeyMsg:
 		// While the filter input is focused, every key goes to it (except a few escapes).
@@ -135,10 +149,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
-			m.focus = (m.focus + 1) % 2
+			// Cycle through visible panes. Context pane only counts if visible.
+			if m.contextPaneWidthEffective() > 0 {
+				m.focus = (m.focus + 1) % 3
+			} else {
+				m.focus = (m.focus + 1) % 2
+			}
 			return m, nil
 		case "shift+tab":
-			m.focus = (m.focus + 1) % 2
+			// Cycle backwards through visible panes.
+			if m.contextPaneWidthEffective() > 0 {
+				m.focus = (m.focus - 1 + 3) % 3
+			} else {
+				m.focus = (m.focus - 1 + 2) % 2
+			}
 			return m, nil
 		case "v":
 			m.toggleView()
@@ -155,25 +179,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "j", "down":
 			if m.view == viewOverview {
 				m.moveOverview(0, +1)
-				return m, nil
+				return m, m.scheduleContextRefresh()
 			}
 			if m.focus == paneLeft {
-				m.moveCursor(+1)
-				return m, nil
+				return m, m.moveCursor(+1)
 			}
 			m.viewport.ScrollDown(1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "k", "up":
 			if m.view == viewOverview {
 				m.moveOverview(0, -1)
-				return m, nil
+				return m, m.scheduleContextRefresh()
 			}
 			if m.focus == paneLeft {
-				m.moveCursor(-1)
-				return m, nil
+				return m, m.moveCursor(-1)
 			}
 			m.viewport.ScrollUp(1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "h", "left":
 			if m.view == viewOverview {
 				m.moveOverview(-1, 0)
@@ -190,35 +212,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == viewOverview {
 				m.fileCursor = m.overviewCursor
 				m.setView(viewChanges)
-				return m, nil
+				return m, m.scheduleContextRefresh()
 			}
 			return m, nil
 		case "g":
 			if m.focus == paneLeft {
-				m.setCursor(0)
-			} else {
-				m.viewport.GotoTop()
+				return m, m.setCursor(0)
 			}
-			return m, nil
+			m.viewport.GotoTop()
+			return m, m.maybeScheduleHunkChange()
 		case "G":
 			if m.focus == paneLeft {
-				m.setCursor(m.maxCursor())
-			} else {
-				m.viewport.GotoBottom()
+				return m, m.setCursor(m.maxCursor())
 			}
-			return m, nil
+			m.viewport.GotoBottom()
+			return m, m.maybeScheduleHunkChange()
 		case "ctrl+d":
 			m.viewport.HalfPageDown()
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "ctrl+u":
 			m.viewport.HalfPageUp()
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "]":
 			m.jumpHunk(+1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "[":
 			m.jumpHunk(-1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "/":
 			if m.view == viewChanges {
 				return m, m.startFiltering()
@@ -260,6 +280,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMsg = "edit done — quit and re-run to refresh"
 		}
+		return m, nil
+
+	case contextRefreshMsg:
+		if msg.Seq != m.contextRefreshSeq {
+			return m, nil // stale
+		}
+		cur := ctxpane.Cursor{
+			File:      m.currentFileForContext(),
+			HunkIndex: m.currentHunkIndex(),
+			Diff:      m.d,
+			RepoRoot:  m.repoRoot,
+		}
+		m.contextCursor = cur
+		seq := msg.Seq
+		return m, func() tea.Msg {
+			return contextResultMsg{Seq: seq, Payload: ctxpane.Resolve(context.Background(), cur)}
+		}
+
+	case contextResultMsg:
+		if msg.Seq != m.contextRefreshSeq {
+			return m, nil // stale
+		}
+		m.contextPayload = msg.Payload
+		m.contextSelected = 0
 		return m, nil
 	}
 
@@ -562,7 +606,7 @@ func (m *Model) setView(v viewMode) {
 	m.refreshDiff()
 }
 
-func (m *Model) moveCursor(delta int) {
+func (m *Model) moveCursor(delta int) tea.Cmd {
 	c := m.cursor() + delta
 	if c < 0 {
 		c = 0
@@ -570,7 +614,7 @@ func (m *Model) moveCursor(delta int) {
 	if c > m.maxCursor() {
 		c = m.maxCursor()
 	}
-	m.setCursor(c)
+	return m.setCursor(c)
 }
 
 func (m *Model) cursor() int {
@@ -583,24 +627,32 @@ func (m *Model) cursor() int {
 	return m.fileCursor
 }
 
-func (m *Model) setCursor(c int) {
+func (m *Model) setCursor(c int) tea.Cmd {
+	changed := false
 	switch m.view {
 	case viewCommits:
 		if c != m.commitCursor {
 			m.commitCursor = c
 			m.refreshDiff()
+			changed = true
 		}
 	case viewOverview:
 		if c != m.overviewCursor {
 			m.overviewCursor = c
 			m.refreshDiff()
+			changed = true
 		}
 	default:
 		if c != m.fileCursor {
 			m.fileCursor = c
 			m.refreshDiff()
+			changed = true
 		}
 	}
+	if changed {
+		return m.scheduleContextRefresh()
+	}
+	return nil
 }
 
 func (m *Model) maxCursor() int {
@@ -1040,6 +1092,27 @@ func (m Model) currentFileForContext() diff.File {
 		return diff.File{}
 	}
 	return files[m.fileCursor]
+}
+
+// scheduleContextRefresh bumps the refresh seqno and returns a Cmd that fires
+// a contextRefreshMsg after the debounce window. Callers should compose this
+// with any other Cmd they return.
+func (m *Model) scheduleContextRefresh() tea.Cmd {
+	m.contextRefreshSeq++
+	seq := m.contextRefreshSeq
+	return tea.Tick(contextDebounce, func(time.Time) tea.Msg {
+		return contextRefreshMsg{Seq: seq}
+	})
+}
+
+// maybeScheduleHunkChange returns a refresh Cmd if the current hunk index
+// has changed since the last context refresh.
+func (m *Model) maybeScheduleHunkChange() tea.Cmd {
+	newHunk := m.currentHunkIndex()
+	if newHunk == m.contextCursor.HunkIndex {
+		return nil
+	}
+	return m.scheduleContextRefresh()
 }
 
 func (m Model) diffTitle() string {

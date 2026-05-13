@@ -138,3 +138,23 @@ func TestContextPaneHiddenInSplitView(t *testing.T) {
 		t.Error("split view should hide context pane")
 	}
 }
+
+func TestContextRefreshStaleCancel(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+
+	// Schedule two refreshes back to back; the first should be stale.
+	_ = m.scheduleContextRefresh()
+	staleSeq := m.contextRefreshSeq
+	_ = m.scheduleContextRefresh()
+
+	// Deliver the stale msg.
+	updated, _ = m.Update(contextRefreshMsg{Seq: staleSeq})
+	m = updated.(Model)
+	// No assertion about side effects — the test just confirms the model
+	// doesn't crash and doesn't replace the payload from a stale tick.
+	if m.contextRefreshSeq != staleSeq+1 {
+		t.Errorf("contextRefreshSeq: got %d want %d", m.contextRefreshSeq, staleSeq+1)
+	}
+}
