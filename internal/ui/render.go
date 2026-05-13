@@ -37,7 +37,7 @@ const (
 // renderOverview lays out file spines side-by-side in a grid that wraps to
 // multiple rows. Returns the joined string and the (rowCount, colCount) grid
 // dimensions so the caller can interpret the cursor index.
-func renderOverview(files []diff.File, width, height, cursor int) (string, int, int) {
+func renderOverview(files []diff.File, reviewed map[string]bool, width, height, cursor int) (string, int, int) {
 	if len(files) == 0 {
 		return mutedStyle.Render("(no files)"), 0, 0
 	}
@@ -55,7 +55,7 @@ func renderOverview(files []diff.File, width, height, cursor int) (string, int, 
 
 	cells := make([]string, len(files))
 	for i, f := range files {
-		cells[i] = renderSpineCell(f, spineRows, spineBarW, i == cursor)
+		cells[i] = renderSpineCell(f, spineRows, spineBarW, i == cursor, reviewed[f.Path])
 	}
 
 	// Lay out grid: stack cells horizontally per row, then join rows vertically.
@@ -73,24 +73,37 @@ func renderOverview(files []diff.File, width, height, cursor int) (string, int, 
 }
 
 // renderSpineCell renders a single file's spine + label + stats inside a
-// bordered cell. Focused cell uses the focus border color.
-func renderSpineCell(f diff.File, rows, barW int, focused bool) string {
-	// Spine bar (rows lines × barW visible cols of styled blocks)
+// bordered cell. Focused cell uses the focus border color. Reviewed files get
+// a ✓ prefix on the label and a dimmer spine bar.
+func renderSpineCell(f diff.File, rows, barW int, focused, reviewed bool) string {
 	spine := renderSpine(f, rows, barW)
 
-	// Label: short file path
-	labelW := spineCellW - 4 // borders + padding
+	labelW := spineCellW - 4
 	if labelW < 4 {
 		labelW = 4
 	}
 	label := compactPath(f.Path, labelW)
+	if reviewed {
+		// Prefix with ✓ (eats 2 visible cols of the label area)
+		label = compactPath(f.Path, labelW-2)
+		label = "✓ " + label
+	}
 	stats := formatFileStats(f)
 
 	var b strings.Builder
-	b.WriteString(spineLabelStyle.Render(label))
+	if reviewed {
+		b.WriteString(mutedStyle.Render(label))
+	} else {
+		b.WriteString(spineLabelStyle.Render(label))
+	}
 	b.WriteString("\n")
 	for _, s := range spine {
-		b.WriteString(s)
+		if reviewed {
+			// Replace styled spine cells with a dim, monochrome version.
+			b.WriteString(mutedStyle.Render(strings.Repeat("·", barW)))
+		} else {
+			b.WriteString(s)
+		}
 		b.WriteString("\n")
 	}
 	b.WriteString(mutedStyle.Render(stats))
@@ -101,7 +114,7 @@ func renderSpineCell(f diff.File, rows, barW int, focused bool) string {
 	}
 	return style.
 		Width(spineCellW - 2).
-		Height(rows + 3). // label + spine rows + stats
+		Height(rows + 3).
 		Render(b.String())
 }
 

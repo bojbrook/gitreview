@@ -55,6 +55,11 @@ type Model struct {
 	filtering       bool   // currently editing the filter
 	filter          string // committed substring filter (empty = no filter)
 	cursorPreFilter int    // fileCursor before filter began, restored on clear
+
+	// reviewed marks — files the user has explicitly marked as walked-through.
+	// Keyed by file path. Persists for the lifetime of the program; not stored
+	// to disk yet.
+	reviewedFiles map[string]bool
 }
 
 // ForceWidth overrides the terminal width bubbletea reports. Useful when
@@ -69,13 +74,14 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
 	ti.Placeholder = "filter files…"
 	ti.CharLimit = 100
 	return Model{
-		d:           d,
-		commits:     commits,
-		commitDiff:  map[string]*diff.Diff{},
-		commitErr:   map[string]error{},
-		repoRoot:    repoRoot,
-		focus:       paneLeft,
-		filterInput: ti,
+		d:             d,
+		commits:       commits,
+		commitDiff:    map[string]*diff.Diff{},
+		commitErr:     map[string]error{},
+		repoRoot:      repoRoot,
+		focus:         paneLeft,
+		filterInput:   ti,
+		reviewedFiles: map[string]bool{},
 	}
 }
 
@@ -213,6 +219,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.filter != "" {
 				m.clearFilter()
 			}
+			return m, nil
+		case "m":
+			m.toggleReviewed()
+			return m, nil
+		case "M":
+			m.jumpToNextUnreviewed()
 			return m, nil
 		case "e":
 			return m, m.openInEditor()
@@ -360,7 +372,14 @@ func (m Model) renderStats() string {
 			}
 		}
 	}
-	return mutedStyle.Render(fmt.Sprintf("%d files · +%d −%d", len(m.d.Files), add, del))
+	parts := []string{
+		fmt.Sprintf("%d files", len(m.d.Files)),
+		fmt.Sprintf("+%d −%d", add, del),
+	}
+	if r := m.reviewedCount(); r > 0 {
+		parts = append(parts, fmt.Sprintf("✓ %d/%d", r, len(m.d.Files)))
+	}
+	return mutedStyle.Render(strings.Join(parts, " · "))
 }
 
 // renderOverviewBody renders the spine grid filling the body area.
@@ -370,7 +389,7 @@ func (m Model) renderOverviewBody() string {
 	if bodyH < 6 {
 		bodyH = 6
 	}
-	out, _, _ := renderOverview(files, m.width, bodyH, m.overviewCursor)
+	out, _, _ := renderOverview(files, m.reviewedFiles, m.width, bodyH, m.overviewCursor)
 	return out
 }
 
@@ -571,6 +590,78 @@ func (m *Model) maxCursor() int {
 	return len(files) - 1
 }
 
+// --- reviewed marks ---
+
+// currentFileIndex returns the cursor's index into the effective file list,
+// or -1 if the current view doesn't have a per-file cursor.
+func (m Model) currentFileIndex() int {
+	switch m.view {
+	case viewChanges:
+		return m.fileCursor
+	case viewOverview:
+		return m.overviewCursor
+	}
+	return -1
+}
+
+func (m *Model) toggleReviewed() {
+	idx := m.currentFileIndex()
+	if idx < 0 {
+		return
+	}
+	files, _ := m.effectiveFiles()
+	if idx >= len(files) {
+		return
+	}
+	path := files[idx].Path
+	if m.reviewedFiles[path] {
+		delete(m.reviewedFiles, path)
+	} else {
+		m.reviewedFiles[path] = true
+	}
+}
+
+func (m *Model) jumpToNextUnreviewed() {
+	start := m.currentFileIndex()
+	if start < 0 {
+		return
+	}
+	files, _ := m.effectiveFiles()
+	n := len(files)
+	if n == 0 {
+		return
+	}
+	for i := 1; i <= n; i++ {
+		next := (start + i) % n
+		if !m.reviewedFiles[files[next].Path] {
+			switch m.view {
+			case viewChanges:
+				m.fileCursor = next
+				m.refreshDiff()
+			case viewOverview:
+				m.overviewCursor = next
+			}
+			return
+		}
+	}
+	m.statusMsg = "all files reviewed"
+}
+
+// reviewedCount returns how many files in the effective list are marked reviewed.
+func (m Model) reviewedCount() int {
+	if len(m.reviewedFiles) == 0 {
+		return 0
+	}
+	files, _ := m.effectiveFiles()
+	n := 0
+	for _, f := range files {
+		if m.reviewedFiles[f.Path] {
+			n++
+		}
+	}
+	return n
+}
+
 // moveOverview moves the 2D cursor in the spine grid by (dx, dy) cells.
 // Wraps on rows (so going past the right edge jumps to the next row).
 func (m *Model) moveOverview(dx, dy int) {
@@ -739,8 +830,8 @@ func (m Model) renderFilesList(leftW int) string {
 	showSpark := rowW >= 30 // only if there's enough room for path + sparkline + stats
 
 	for i, f := range files {
+		reviewed := m.reviewedFiles[f.Path]
 		statsPlain := formatFileStats(f)
-		// Reserve: "M " (2) + spaces (≥1) + stats. Add sparkline + 2 spaces if shown.
 		reserve := 3 + len(statsPlain)
 		if showSpark {
 			reserve += sparkW + 2
@@ -751,8 +842,16 @@ func (m Model) renderFilesList(leftW int) string {
 		}
 		name := compactPath(f.Path, pathMaxW)
 
+		// Plain content for the cursor row (cursorStyle bg needs no inner ANSI).
+		var plainMarker string
+		if reviewed {
+			plainMarker = "✓"
+		} else {
+			plainMarker = f.Status.String()
+		}
+		plainLeft := fmt.Sprintf("%s %s", plainMarker, name)
+
 		if i == m.fileCursor {
-			plainLeft := fmt.Sprintf("%s %s", f.Status, name)
 			if showSpark {
 				right := renderSparklinePlain(f, sparkW) + "  " + statsPlain
 				lines = append(lines, cursorStyle.Render(padBetweenAnsi(plainLeft, right, rowW)))
@@ -760,16 +859,30 @@ func (m Model) renderFilesList(leftW int) string {
 				row := padBetweenPlain(plainLeft, statsPlain, rowW)
 				lines = append(lines, cursorStyle.Render(row))
 			}
-		} else {
-			coloredLeft := fmt.Sprintf("%s %s", statusMarker(f.Status), name)
-			coloredStats := mutedStyle.Render(statsPlain)
+			continue
+		}
+
+		// Non-cursor rows: dim everything when reviewed, otherwise colorize.
+		var coloredLeft, coloredStats, sparkText string
+		if reviewed {
+			coloredLeft = mutedStyle.Render(fmt.Sprintf("✓ %s", name))
+			coloredStats = mutedStyle.Render(statsPlain)
 			if showSpark {
-				right := renderSparkline(f, sparkW) + "  " + coloredStats
-				lines = append(lines, padBetweenAnsi(coloredLeft, right, rowW))
-			} else {
-				row := padBetweenAnsi(coloredLeft, coloredStats, rowW)
-				lines = append(lines, row)
+				sparkText = mutedStyle.Render(renderSparklinePlain(f, sparkW))
 			}
+		} else {
+			coloredLeft = fmt.Sprintf("%s %s", statusMarker(f.Status), name)
+			coloredStats = mutedStyle.Render(statsPlain)
+			if showSpark {
+				sparkText = renderSparkline(f, sparkW)
+			}
+		}
+
+		if showSpark {
+			right := sparkText + "  " + coloredStats
+			lines = append(lines, padBetweenAnsi(coloredLeft, right, rowW))
+		} else {
+			lines = append(lines, padBetweenAnsi(coloredLeft, coloredStats, rowW))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -905,7 +1018,7 @@ func (m Model) renderHelp() string {
 	if m.splitView {
 		splitHint = "s: unified"
 	}
-	parts := []string{"j/k file", "]/[ hunk", "/ filter", "tab focus", "1/2 tab", splitHint, "e edit", "q quit"}
+	parts := []string{"j/k file", "]/[ hunk", "m mark", "M next-unreviewed", "/ filter", "1/2/3 tab", splitHint, "e edit", "q quit"}
 	if m.filter != "" {
 		parts = append([]string{"c clear-filter"}, parts...)
 	}
