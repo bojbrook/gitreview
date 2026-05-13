@@ -16,6 +16,7 @@ func main() {
 		working   = flag.Bool("working", false, "show only uncommitted changes (staged + unstaged) vs HEAD")
 		staged    = flag.Bool("staged", false, "show only staged changes vs HEAD")
 		committed = flag.Bool("committed", false, "show only committed changes between merge-base and HEAD (no working tree)")
+		width     = flag.Int("width", 0, "force terminal width (use when bubbletea reports the wrong size, e.g. inside tmux)")
 	)
 	flag.Parse()
 
@@ -47,7 +48,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "gitreview: warn: could not resolve repo root:", err)
 	}
 
-	p := tea.NewProgram(ui.New(d, commits, repoRoot), tea.WithAltScreen())
+	m := ui.New(d, commits, repoRoot)
+	if *width > 0 {
+		m.ForceWidth(*width)
+	}
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "gitreview:", err)
 		os.Exit(1)

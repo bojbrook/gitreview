@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/bowenbrooks/gitreview/internal/diff"
@@ -9,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/term"
 )
 
 type pane int
@@ -35,11 +37,19 @@ type Model struct {
 	fileCursor   int
 	commitCursor int
 	focus        pane
+	splitView    bool
 	width        int
 	height       int
+	forcedWidth  int
 	viewport     viewport.Model
 	ready        bool
 	statusMsg    string
+}
+
+// ForceWidth overrides the terminal width bubbletea reports. Useful when
+// running inside a multiplexer that reports a stale or wrong size.
+func (m *Model) ForceWidth(w int) {
+	m.forcedWidth = w
 }
 
 func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
@@ -65,6 +75,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// Query the OS directly for terminal size. If it reports a smaller
+		// width than bubbletea (which can happen inside tmux or when the
+		// shell's COLUMNS is stale), trust the OS — content wider than the
+		// physical terminal causes the per-line wrap we've been chasing.
+		if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
+			if w > 0 && w < m.width {
+				m.width = w
+			}
+			if h > 0 && h < m.height {
+				m.height = h
+			}
+		}
+		if m.forcedWidth > 0 {
+			m.width = m.forcedWidth
+		}
 		m.layout()
 		m.refreshDiff()
 		m.ready = true
@@ -125,6 +150,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "e":
 			return m, m.openInEditor()
+		case "s":
+			if m.view == viewChanges {
+				m.splitView = !m.splitView
+				m.refreshDiff()
+			} else {
+				m.statusMsg = "split view only available in Changes view"
+			}
+			return m, nil
 		}
 
 	case editorDoneMsg:
@@ -293,7 +326,7 @@ func (m *Model) layout() {
 	bodyH := m.height - helpHeight
 	leftW := int(float64(m.width) * leftRatio)
 	centerW := m.width - leftW
-	innerW := centerW - 2
+	innerW := centerW - 4 // borders (2) + horizontal padding (2)
 	innerH := bodyH - 2 - 1
 
 	if !m.ready {
@@ -315,7 +348,11 @@ func (m *Model) refreshDiff() {
 			m.fileCursor = 0
 		}
 		f := d.Files[m.fileCursor]
-		m.viewport.SetContent(renderDiff(f, m.viewport.Width))
+		if m.splitView {
+			m.viewport.SetContent(renderSplit(f, m.viewport.Width))
+		} else {
+			m.viewport.SetContent(renderDiff(f, m.viewport.Width))
+		}
 	} else {
 		m.viewport.SetContent(renderFullDiff(d.Files, m.viewport.Width))
 	}
@@ -393,22 +430,46 @@ func (m Model) renderFilesList(leftW int) string {
 	if m.d == nil || len(m.d.Files) == 0 {
 		return mutedStyle.Render("(no files)")
 	}
+	rowW := leftW - 4 // borders (2) + horizontal padding (2)
+	if rowW < 8 {
+		rowW = 8
+	}
+
 	var lines []string
 	sub := fmt.Sprintf("%d files", len(m.d.Files))
 	if m.d.Label != "" {
 		sub = m.d.Label + " · " + sub
 	}
-	lines = append(lines, mutedStyle.Render(truncateRaw(sub, leftW-4)))
+	lines = append(lines, mutedStyle.Render(truncateRaw(sub, rowW)))
+
 	for i, f := range m.d.Files {
-		marker := statusMarker(f.Status)
-		name := compactPath(f.Path, leftW-6)
-		row := fmt.Sprintf("%s %s", marker, name)
-		if i == m.fileCursor {
-			row = cursorStyle.Render(row)
+		statsPlain := formatFileStats(f)
+		pathMaxW := rowW - 3 - len(statsPlain) // "M " (2) + " " between path/stats (1) + stats
+		if pathMaxW < 4 {
+			pathMaxW = 4
 		}
-		lines = append(lines, row)
+		name := compactPath(f.Path, pathMaxW)
+
+		if i == m.fileCursor {
+			// Plain content (no inner ANSI) so cursorStyle's background renders cleanly.
+			plainLeft := fmt.Sprintf("%s %s", f.Status, name)
+			row := padBetweenPlain(plainLeft, statsPlain, rowW)
+			lines = append(lines, cursorStyle.Render(row))
+		} else {
+			coloredLeft := fmt.Sprintf("%s %s", statusMarker(f.Status), name)
+			coloredStats := mutedStyle.Render(statsPlain)
+			row := padBetweenAnsi(coloredLeft, coloredStats, rowW)
+			lines = append(lines, row)
+		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func padBetweenPlain(left, right string, width int) string {
+	if len(left)+len(right) >= width {
+		return left
+	}
+	return left + strings.Repeat(" ", width-len(left)-len(right)) + right
 }
 
 func (m Model) renderCommitsList(leftW int) string {
@@ -465,7 +526,11 @@ func (m Model) currentDiffReadonly() *diff.Diff {
 }
 
 func (m Model) renderHelp() string {
-	parts := []string{"j/k: nav", "scroll: J/K", "tab: focus", "1/2 or v: switch tab", "e: edit", "q: quit"}
+	splitHint := "s: split"
+	if m.splitView {
+		splitHint = "s: unified"
+	}
+	parts := []string{"j/k: file", "tab: focus", "1/2: tab", splitHint, "e: edit", "q: quit"}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {
 		hint = mutedStyle.Render(m.statusMsg) + "  ·  " + hint

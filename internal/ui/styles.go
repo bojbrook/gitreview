@@ -20,7 +20,8 @@ var (
 var (
 	paneStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colBorder)
+			BorderForeground(colBorder).
+			Padding(0, 1)
 
 	paneFocusStyle = paneStyle.
 			BorderForeground(colBorderFocus)
@@ -53,4 +54,10 @@ var (
 				Foreground(colMuted)
 
 	tabSepStyle = lipgloss.NewStyle().Foreground(colBorder)
+
+	// splitDividerStyle is the BEFORE/AFTER divider in split view — bright + bold
+	// so it reads as a hard boundary, not a subtle separator.
+	splitDividerStyle = lipgloss.NewStyle().
+				Foreground(colBorderFocus).
+				Bold(true)
 )
