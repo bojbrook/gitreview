@@ -11,7 +11,7 @@ import (
 // declRegex matches lines that open a function/class/method-like declaration
 // in the languages we want coarse support for. Intentionally permissive: the
 // goal is "name the enclosing thing", not perfect parsing.
-var declRegex = regexp.MustCompile(`^\s*(?:(?:func|def|class|function|fn)\s+\(?([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*)\s*=\s*function)`)
+var declRegex = regexp.MustCompile(`^\s*(?:func\s+(?:\([^)]+\)\s+)?([A-Za-z_][A-Za-z0-9_]*)|(?:def|class|function|fn)\s+([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*)\s*=\s*function)`)
 
 // containingDecl walks the file content backwards from anchorLine looking for
 // the most recent declaration line. Returns the declared identifier and the

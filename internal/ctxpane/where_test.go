@@ -31,6 +31,39 @@ func Inner(x int) int {
 	}
 }
 
+func TestContainingDecl_GoMethod(t *testing.T) {
+	body := `package foo
+
+type Model struct{}
+
+func (m *Model) Update() {
+	return
+}
+
+func (m Model) View() string {
+	return ""
+}
+`
+	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	name, line := containingDecl(lines, 6)
+	if name != "Update" || line != 5 {
+		t.Errorf("pointer receiver: got (%q, %d) want (Update, 5)", name, line)
+	}
+	name, line = containingDecl(lines, 10)
+	if name != "View" || line != 9 {
+		t.Errorf("value receiver: got (%q, %d) want (View, 9)", name, line)
+	}
+}
+
+func TestContainingDecl_GoMethodOnGitReviewItself(t *testing.T) {
+	// Real-world line that previously returned "m" instead of "View".
+	lines := []string{`func (m Model) View() string {`}
+	name, _ := containingDecl(lines, 1)
+	if name != "View" {
+		t.Errorf("got %q want View — receiver leaked through", name)
+	}
+}
+
 func TestContainingDecl_Python(t *testing.T) {
 	body := `class Foo:
     def bar(self):
