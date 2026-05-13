@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/bowenbrooks/gitreview/internal/diff"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -26,6 +27,230 @@ func renderFullDiff(files []diff.File, width int) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+const (
+	spineCellW = 14 // total width of a spine cell (bar + label + padding)
+	spineBarW  = 6  // width of the bar within a cell
+)
+
+// renderOverview lays out file spines side-by-side in a grid that wraps to
+// multiple rows. Returns the joined string and the (rowCount, colCount) grid
+// dimensions so the caller can interpret the cursor index.
+func renderOverview(files []diff.File, width, height, cursor int) (string, int, int) {
+	if len(files) == 0 {
+		return mutedStyle.Render("(no files)"), 0, 0
+	}
+	cols := width / spineCellW
+	if cols < 1 {
+		cols = 1
+	}
+	rowCount := (len(files) + cols - 1) / cols
+	// Height available for spine bars: total height − cell chrome (label + stats + border rows)
+	const chromeRows = 4 // file name (1) + stats (1) + top border (1) + bottom border (1)
+	spineRows := height/rowCount - chromeRows
+	if spineRows < 4 {
+		spineRows = 4
+	}
+
+	cells := make([]string, len(files))
+	for i, f := range files {
+		cells[i] = renderSpineCell(f, spineRows, spineBarW, i == cursor)
+	}
+
+	// Lay out grid: stack cells horizontally per row, then join rows vertically.
+	var rows []string
+	for r := 0; r < rowCount; r++ {
+		start := r * cols
+		end := start + cols
+		if end > len(cells) {
+			end = len(cells)
+		}
+		row := lipgloss.JoinHorizontal(lipgloss.Top, cells[start:end]...)
+		rows = append(rows, row)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, rows...), rowCount, cols
+}
+
+// renderSpineCell renders a single file's spine + label + stats inside a
+// bordered cell. Focused cell uses the focus border color.
+func renderSpineCell(f diff.File, rows, barW int, focused bool) string {
+	// Spine bar (rows lines × barW visible cols of styled blocks)
+	spine := renderSpine(f, rows, barW)
+
+	// Label: short file path
+	labelW := spineCellW - 4 // borders + padding
+	if labelW < 4 {
+		labelW = 4
+	}
+	label := compactPath(f.Path, labelW)
+	stats := formatFileStats(f)
+
+	var b strings.Builder
+	b.WriteString(spineLabelStyle.Render(label))
+	b.WriteString("\n")
+	for _, s := range spine {
+		b.WriteString(s)
+		b.WriteString("\n")
+	}
+	b.WriteString(mutedStyle.Render(stats))
+
+	style := paneStyle
+	if focused {
+		style = paneFocusStyle
+	}
+	return style.
+		Width(spineCellW - 2).
+		Height(rows + 3). // label + spine rows + stats
+		Render(b.String())
+}
+
+// fileLength returns the post-change line count of a file, used as the file's
+// "extent" when projecting changes onto a spine. Approximated as max NewNum
+// (or OldNum for deleted files) across all hunk lines.
+func fileLength(f diff.File) int {
+	max := 0
+	for _, h := range f.Hunks {
+		for _, l := range h.Lines {
+			n := l.NewNum
+			if n == 0 {
+				n = l.OldNum
+			}
+			if n > max {
+				max = n
+			}
+		}
+	}
+	if max == 0 {
+		return 1
+	}
+	return max
+}
+
+// spineBucket represents one row of a file spine: how many added and removed
+// lines from the file fall into this row's slice of the file's extent.
+type spineBucket struct {
+	added   int
+	removed int
+}
+
+// computeSpine projects a file's diff onto `rows` vertical buckets and returns
+// the per-bucket add/remove counts. Bucket 0 = top of file, last bucket = end.
+func computeSpine(f diff.File, rows int) []spineBucket {
+	if rows < 1 {
+		return nil
+	}
+	buckets := make([]spineBucket, rows)
+	length := fileLength(f)
+	if length < 1 {
+		return buckets
+	}
+	for _, h := range f.Hunks {
+		for _, l := range h.Lines {
+			if l.Kind == diff.LineContext {
+				continue
+			}
+			n := l.NewNum
+			if n == 0 {
+				n = l.OldNum
+			}
+			if n < 1 {
+				continue
+			}
+			row := (n - 1) * rows / length
+			if row >= rows {
+				row = rows - 1
+			}
+			switch l.Kind {
+			case diff.LineAdded:
+				buckets[row].added++
+			case diff.LineRemoved:
+				buckets[row].removed++
+			}
+		}
+	}
+	return buckets
+}
+
+// renderSpine returns a vertical bar of `rows` rows, `barW` cols wide. Each
+// row's character + color encodes the bucket's add/remove density.
+func renderSpine(f diff.File, rows, barW int) []string {
+	buckets := computeSpine(f, rows)
+	out := make([]string, rows)
+	// Determine the max density across the file for normalization.
+	maxD := 0
+	for _, b := range buckets {
+		d := b.added + b.removed
+		if d > maxD {
+			maxD = d
+		}
+	}
+	for i, b := range buckets {
+		out[i] = spineCell(b, maxD, barW)
+	}
+	return out
+}
+
+func spineCell(b spineBucket, maxD, w int) string {
+	total := b.added + b.removed
+	if total == 0 || maxD == 0 {
+		return strings.Repeat("·", w)
+	}
+	// Pick a char by relative density.
+	ratio := float64(total) / float64(maxD)
+	var ch string
+	switch {
+	case ratio < 0.25:
+		ch = "░"
+	case ratio < 0.5:
+		ch = "▒"
+	case ratio < 0.75:
+		ch = "▓"
+	default:
+		ch = "█"
+	}
+	bar := strings.Repeat(ch, w)
+	// Color: if mostly added → green; mostly removed → red; mixed → orange.
+	switch {
+	case b.removed == 0:
+		return addedLineStyle.Render(bar)
+	case b.added == 0:
+		return removedLineStyle.Render(bar)
+	default:
+		return lipgloss.NewStyle().Foreground(colStatusMod).Render(bar)
+	}
+}
+
+// hunkOffsetsUnified returns the viewport line index of each hunk header in
+// the output of renderDiff(f, _). One entry per hunk.
+func hunkOffsetsUnified(f diff.File) []int {
+	if len(f.Hunks) == 0 {
+		return nil
+	}
+	out := make([]int, len(f.Hunks))
+	out[0] = 0
+	for i := 1; i < len(f.Hunks); i++ {
+		// Previous hunk: 1 header + N content lines, plus 1 blank line written by
+		// the `b.WriteString("\n")` in renderDiff between hunks.
+		out[i] = out[i-1] + 1 + len(f.Hunks[i-1].Lines) + 1
+	}
+	return out
+}
+
+// hunkOffsetsSplit returns the viewport line index of each hunk header in the
+// output of renderSplit(f, _). Accounts for the BEFORE/AFTER header row and
+// the inter-hunk blank row.
+func hunkOffsetsSplit(f diff.File) []int {
+	if len(f.Hunks) == 0 {
+		return nil
+	}
+	out := make([]int, len(f.Hunks))
+	out[0] = 1 // row 0 is the BEFORE/AFTER header; first hunk header is row 1
+	for i := 1; i < len(f.Hunks); i++ {
+		// 1 (hunk header) + paired-row count + 1 (inter-hunk blank).
+		out[i] = out[i-1] + 1 + len(pairHunkLines(f.Hunks[i-1])) + 1
+	}
+	return out
 }
 
 // renderDiff produces a styled unified-diff string for a file.
