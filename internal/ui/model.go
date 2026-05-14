@@ -40,7 +40,7 @@ type Model struct {
 	commitErr              map[string]error
 	repoRoot               string
 	view                   viewMode
-	fileCursor             int
+	rowCursor              int
 	commitCursor           int
 	overviewCursor         int // index into the filtered Files list when in overview view
 	overviewCols           int // computed at render time so j/k can move by row
@@ -61,10 +61,9 @@ type Model struct {
 	statusMsg              string
 
 	// filter state for the file list
-	filterInput     textinput.Model
-	filtering       bool   // currently editing the filter
-	filter          string // committed substring filter (empty = no filter)
-	cursorPreFilter int    // fileCursor before filter began, restored on clear
+	filterInput textinput.Model
+	filtering   bool   // currently editing the filter
+	filter      string // committed substring filter (empty = no filter)
 
 	// tree state for the file explorer (Changes view).
 	treeRows           []treeRow
@@ -217,8 +216,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			if m.view == viewOverview {
-				m.fileCursor = m.overviewCursor
-				m.setView(viewChanges)
+				files, _ := m.effectiveFiles()
+				if m.overviewCursor >= 0 && m.overviewCursor < len(files) {
+					target := files[m.overviewCursor].Path
+					m.setView(viewChanges)
+					if row := RowOfFile(m.treeRows, target); row >= 0 {
+						m.rowCursor = row
+						m.refreshDiff()
+					}
+				} else {
+					m.setView(viewChanges)
+				}
 				return m, m.scheduleContextRefresh()
 			}
 			if m.focus == paneContext {
@@ -372,11 +380,11 @@ func (m *Model) selectedEditTarget() (diff.File, int, bool) {
 		// In commits view there's no file cursor — open the first file of the commit's diff.
 		f = d.Files[0]
 	} else {
-		files, _ := m.effectiveFiles()
-		if m.fileCursor >= len(files) {
+		fr, _, ok := m.currentFileRow()
+		if !ok {
 			return diff.File{}, 0, false
 		}
-		f = files[m.fileCursor]
+		f = fr
 	}
 	if f.Status == diff.StatusDeleted {
 		return diff.File{}, 0, false
@@ -499,9 +507,6 @@ const (
 // --- filter ---
 
 func (m *Model) startFiltering() tea.Cmd {
-	if !m.filtering {
-		m.cursorPreFilter = m.fileCursor
-	}
 	m.filtering = true
 	m.filterInput.SetValue(m.filter)
 	m.filterInput.CursorEnd()
@@ -512,7 +517,7 @@ func (m *Model) commitFilter() {
 	m.filter = strings.TrimSpace(m.filterInput.Value())
 	m.filtering = false
 	m.filterInput.Blur()
-	m.fileCursor = 0
+	m.rowCursor = 0
 	m.refreshDiff()
 }
 
@@ -525,7 +530,7 @@ func (m *Model) cancelFilter() {
 func (m *Model) clearFilter() {
 	m.filter = ""
 	m.filterInput.SetValue("")
-	m.fileCursor = m.cursorPreFilter
+	m.rowCursor = 0
 	m.refreshDiff()
 }
 
@@ -542,7 +547,7 @@ func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.filterInput, cmd = m.filterInput.Update(msg)
 	// Live update: re-filter and refresh the diff for the first matching file.
 	m.filter = strings.TrimSpace(m.filterInput.Value())
-	m.fileCursor = 0
+	m.rowCursor = 0
 	m.refreshDiff()
 	return m, cmd
 }
@@ -647,7 +652,32 @@ func (m *Model) cursor() int {
 	case viewOverview:
 		return m.overviewCursor
 	}
-	return m.fileCursor
+	return m.rowCursor
+}
+
+// rowAtCursor returns the row the cursor currently points at, or a zero-value
+// row if the cursor is out of range (e.g. tree just rebuilt, treeRows empty).
+func (m Model) rowAtCursor() treeRow {
+	if m.rowCursor < 0 || m.rowCursor >= len(m.treeRows) {
+		return treeRow{}
+	}
+	return m.treeRows[m.rowCursor]
+}
+
+// currentFileRow returns the underlying diff.File for the row under the
+// cursor. ok is false when the cursor is on a dir row or out of range.
+// fileIdx is the index into m.effectiveFiles() — useful for callers that
+// need to index into the file slice directly.
+func (m Model) currentFileRow() (f diff.File, fileIdx int, ok bool) {
+	r := m.rowAtCursor()
+	if r.Kind != rowFile {
+		return diff.File{}, -1, false
+	}
+	files, _ := m.effectiveFiles()
+	if r.FileIdx < 0 || r.FileIdx >= len(files) {
+		return diff.File{}, -1, false
+	}
+	return files[r.FileIdx], r.FileIdx, true
 }
 
 func (m *Model) setCursor(c int) tea.Cmd {
@@ -666,8 +696,8 @@ func (m *Model) setCursor(c int) tea.Cmd {
 			changed = true
 		}
 	default:
-		if c != m.fileCursor {
-			m.fileCursor = c
+		if c != m.rowCursor {
+			m.rowCursor = c
 			m.refreshDiff()
 			changed = true
 		}
@@ -682,6 +712,9 @@ func (m *Model) maxCursor() int {
 	if m.view == viewCommits {
 		return len(m.commits) - 1
 	}
+	if m.view == viewChanges {
+		return len(m.treeRows) - 1
+	}
 	files, _ := m.effectiveFiles()
 	return len(files) - 1
 }
@@ -689,11 +722,16 @@ func (m *Model) maxCursor() int {
 // --- reviewed marks ---
 
 // currentFileIndex returns the cursor's index into the effective file list,
-// or -1 if the current view doesn't have a per-file cursor.
+// or -1 if the current view doesn't have a per-file cursor OR the cursor is
+// on a dir row.
 func (m Model) currentFileIndex() int {
 	switch m.view {
 	case viewChanges:
-		return m.fileCursor
+		_, fileIdx, ok := m.currentFileRow()
+		if !ok {
+			return -1
+		}
+		return fileIdx
 	case viewOverview:
 		return m.overviewCursor
 	}
@@ -701,42 +739,51 @@ func (m Model) currentFileIndex() int {
 }
 
 func (m *Model) toggleReviewed() {
-	idx := m.currentFileIndex()
-	if idx < 0 {
+	f, _, ok := m.currentFileRow()
+	if !ok {
+		m.statusMsg = "m: select a file to mark"
 		return
 	}
-	files, _ := m.effectiveFiles()
-	if idx >= len(files) {
-		return
-	}
-	path := files[idx].Path
-	if m.reviewedFiles[path] {
-		delete(m.reviewedFiles, path)
+	if m.reviewedFiles[f.Path] {
+		delete(m.reviewedFiles, f.Path)
 	} else {
-		m.reviewedFiles[path] = true
+		m.reviewedFiles[f.Path] = true
 	}
 }
 
 func (m *Model) jumpToNextUnreviewed() {
-	start := m.currentFileIndex()
-	if start < 0 {
+	if m.view == viewChanges {
+		n := len(m.treeRows)
+		if n == 0 {
+			return
+		}
+		start := m.rowCursor
+		for i := 1; i <= n; i++ {
+			next := (start + i) % n
+			r := m.treeRows[next]
+			if r.Kind != rowFile {
+				continue
+			}
+			if !m.reviewedFiles[r.Path] {
+				m.rowCursor = next
+				m.refreshDiff()
+				return
+			}
+		}
+		m.statusMsg = "all files reviewed"
 		return
 	}
+	// Existing overview path: walk by file index as before.
 	files, _ := m.effectiveFiles()
 	n := len(files)
 	if n == 0 {
 		return
 	}
+	start := m.overviewCursor
 	for i := 1; i <= n; i++ {
 		next := (start + i) % n
 		if !m.reviewedFiles[files[next].Path] {
-			switch m.view {
-			case viewChanges:
-				m.fileCursor = next
-				m.refreshDiff()
-			case viewOverview:
-				m.overviewCursor = next
-			}
+			m.overviewCursor = next
 			return
 		}
 	}
@@ -831,13 +878,21 @@ func (m *Model) contextJumpToSelected() tea.Cmd {
 	if it.Jump == nil {
 		return nil
 	}
+	// Check that the target file is in the diff before jumping.
 	files, _ := m.effectiveFiles()
-	for i, f := range files {
+	inDiff := false
+	for _, f := range files {
 		if f.Path == it.Jump.File {
-			m.fileCursor = i
-			m.refreshDiff()
+			inDiff = true
 			break
 		}
+	}
+	if inDiff {
+		m.refreshDiff()
+		if row := RowOfFile(m.treeRows, it.Jump.File); row >= 0 {
+			m.rowCursor = row
+		}
+		m.refreshDiff()
 	}
 	// We don't scroll the viewport to it.Jump.Line — viewport line math is
 	// non-trivial. File-level jump is the v0 promise.
@@ -904,6 +959,15 @@ func (m *Model) refreshDiff() {
 		m.hunkOffsets = nil
 		return
 	}
+
+	// Rebuild the file-explorer tree first so currentFileRow() is accurate.
+	if m.view == viewChanges {
+		files, _ := m.effectiveFiles()
+		m.treeRows = BuildTree(files, m.reviewedFiles, m.treeCollapsed, m.filter)
+	} else {
+		m.treeRows = nil
+	}
+
 	if m.view == viewChanges {
 		files, _ := m.effectiveFiles()
 		if len(files) == 0 {
@@ -911,10 +975,13 @@ func (m *Model) refreshDiff() {
 			m.hunkOffsets = nil
 			return
 		}
-		if m.fileCursor >= len(files) {
-			m.fileCursor = 0
+		fr, _, ok := m.currentFileRow()
+		if !ok {
+			m.viewport.SetContent(mutedStyle.Render("(select a file)"))
+			m.hunkOffsets = nil
+			return
 		}
-		f := files[m.fileCursor]
+		f := fr
 		if m.splitView {
 			m.viewport.SetContent(renderSplit(f, m.viewport.Width))
 			m.hunkOffsets = hunkOffsetsSplit(f)
@@ -930,14 +997,6 @@ func (m *Model) refreshDiff() {
 		}
 		m.viewport.SetContent(renderFullDiff(d.Files, m.viewport.Width))
 		m.hunkOffsets = nil
-	}
-
-	// Rebuild the file-explorer tree for the Changes view.
-	if m.view == viewChanges {
-		files, _ := m.effectiveFiles()
-		m.treeRows = BuildTree(files, m.reviewedFiles, m.treeCollapsed, m.filter)
-	} else {
-		m.treeRows = nil
 	}
 
 	m.viewport.GotoTop()
@@ -1000,16 +1059,15 @@ func (m Model) renderFilesList(leftW int) string {
 	if m.d == nil || len(m.d.Files) == 0 {
 		return mutedStyle.Render("(no files)")
 	}
-	rowW := leftW - 4 // borders (2) + horizontal padding (2)
+	rowW := leftW - 4 // borders + padding
 	if rowW < 8 {
 		rowW = 8
 	}
 
-	files, _ := m.effectiveFiles()
-
 	var lines []string
 	var sub string
 	if m.filter != "" {
+		files, _ := m.effectiveFiles()
 		sub = fmt.Sprintf("%d/%d files · /%s", len(files), len(m.d.Files), m.filter)
 	} else {
 		sub = fmt.Sprintf("%d files", len(m.d.Files))
@@ -1019,71 +1077,152 @@ func (m Model) renderFilesList(leftW int) string {
 	}
 	lines = append(lines, mutedStyle.Render(truncateRaw(sub, rowW)))
 
-	if len(files) == 0 {
+	if len(m.treeRows) == 0 {
 		lines = append(lines, mutedStyle.Render("(no matches)"))
 		return strings.Join(lines, "\n")
 	}
 
 	const sparkW = 6
-	showSpark := rowW >= 30 // only if there's enough room for path + sparkline + stats
+	showSpark := rowW >= 30
 
-	for i, f := range files {
+	for i, r := range m.treeRows {
+		var rendered string
+		switch r.Kind {
+		case rowDir:
+			rendered = renderTreeDir(r, m.treeCollapsed[r.Path], rowW)
+		case rowFile:
+			files, _ := m.effectiveFiles()
+			if r.FileIdx < 0 || r.FileIdx >= len(files) {
+				continue
+			}
+			f := files[r.FileIdx]
+			reviewed := m.reviewedFiles[f.Path]
+			rendered = renderTreeFile(r, f, reviewed, showSpark, sparkW, rowW)
+		}
+		if i == m.rowCursor {
+			plain := stripAnsiForCursor(r, m, rowW, sparkW, showSpark)
+			rendered = cursorStyle.Render(plain)
+		}
+		lines = append(lines, rendered)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderTreeDir renders a dir row: marker + compact-path + right-aligned aggregate.
+func renderTreeDir(r treeRow, collapsed bool, rowW int) string {
+	marker := "▾ "
+	if collapsed {
+		marker = "▸ "
+	}
+	left := marker + r.Label
+	right := ""
+	if r.Total > 0 {
+		if r.Reviewed == r.Total {
+			right = addedLineStyle.Render("✓")
+		} else if r.Reviewed > 0 {
+			right = mutedStyle.Render(fmt.Sprintf("✓ %d/%d", r.Reviewed, r.Total))
+		}
+	}
+	left = truncateRaw(left, rowW-ansi.StringWidth(right)-1)
+	if right == "" {
+		return left
+	}
+	return padBetweenAnsi(left, right, rowW)
+}
+
+// renderTreeFile renders a file row: 2-col indent + guide + status + filename, plus stats/sparkline.
+func renderTreeFile(r treeRow, f diff.File, reviewed bool, showSpark bool, sparkW int, rowW int) string {
+	const indent = "  │ "
+	statsPlain := formatFileStats(f)
+	reserve := len(indent) + 3 + len(statsPlain)
+	if showSpark {
+		reserve += sparkW + 2
+	}
+	nameMaxW := rowW - reserve
+	if nameMaxW < 4 {
+		nameMaxW = 4
+	}
+	name := compactPath(r.Label, nameMaxW)
+
+	var marker string
+	if reviewed {
+		marker = "✓"
+	} else {
+		marker = statusMarker(f.Status)
+	}
+	left := indent + marker + " " + name
+	if reviewed {
+		left = mutedStyle.Render(indent + "✓ " + name)
+	}
+	var right string
+	if showSpark {
+		if reviewed {
+			right = mutedStyle.Render(renderSparklinePlain(f, sparkW)) + "  " + mutedStyle.Render(statsPlain)
+		} else {
+			right = renderSparkline(f, sparkW) + "  " + mutedStyle.Render(statsPlain)
+		}
+	} else {
+		right = mutedStyle.Render(statsPlain)
+	}
+	return padBetweenAnsi(left, right, rowW)
+}
+
+// stripAnsiForCursor builds the plain (no-ANSI) version of a row for the
+// cursor highlight (cursorStyle's background needs uniform text underneath).
+func stripAnsiForCursor(r treeRow, m Model, rowW, sparkW int, showSpark bool) string {
+	switch r.Kind {
+	case rowDir:
+		marker := "▾ "
+		if m.treeCollapsed[r.Path] {
+			marker = "▸ "
+		}
+		left := marker + r.Label
+		var right string
+		if r.Total > 0 {
+			if r.Reviewed == r.Total {
+				right = "✓"
+			} else if r.Reviewed > 0 {
+				right = fmt.Sprintf("✓ %d/%d", r.Reviewed, r.Total)
+			}
+		}
+		if right == "" {
+			return padBetweenPlain(left, "", rowW)
+		}
+		return padBetweenPlain(left, right, rowW)
+	case rowFile:
+		files, _ := m.effectiveFiles()
+		if r.FileIdx < 0 || r.FileIdx >= len(files) {
+			return ""
+		}
+		f := files[r.FileIdx]
+		const indent = "  │ "
 		reviewed := m.reviewedFiles[f.Path]
 		statsPlain := formatFileStats(f)
-		reserve := 3 + len(statsPlain)
+		reserve := len(indent) + 3 + len(statsPlain)
 		if showSpark {
 			reserve += sparkW + 2
 		}
-		pathMaxW := rowW - reserve
-		if pathMaxW < 4 {
-			pathMaxW = 4
+		nameMaxW := rowW - reserve
+		if nameMaxW < 4 {
+			nameMaxW = 4
 		}
-		name := compactPath(f.Path, pathMaxW)
-
-		// Plain content for the cursor row (cursorStyle bg needs no inner ANSI).
-		var plainMarker string
+		name := compactPath(r.Label, nameMaxW)
+		var marker string
 		if reviewed {
-			plainMarker = "✓"
+			marker = "✓"
 		} else {
-			plainMarker = f.Status.String()
+			marker = f.Status.String()
 		}
-		plainLeft := fmt.Sprintf("%s %s", plainMarker, name)
-
-		if i == m.fileCursor {
-			if showSpark {
-				right := renderSparklinePlain(f, sparkW) + "  " + statsPlain
-				lines = append(lines, cursorStyle.Render(padBetweenAnsi(plainLeft, right, rowW)))
-			} else {
-				row := padBetweenPlain(plainLeft, statsPlain, rowW)
-				lines = append(lines, cursorStyle.Render(row))
-			}
-			continue
-		}
-
-		// Non-cursor rows: dim everything when reviewed, otherwise colorize.
-		var coloredLeft, coloredStats, sparkText string
-		if reviewed {
-			coloredLeft = mutedStyle.Render(fmt.Sprintf("✓ %s", name))
-			coloredStats = mutedStyle.Render(statsPlain)
-			if showSpark {
-				sparkText = mutedStyle.Render(renderSparklinePlain(f, sparkW))
-			}
-		} else {
-			coloredLeft = fmt.Sprintf("%s %s", statusMarker(f.Status), name)
-			coloredStats = mutedStyle.Render(statsPlain)
-			if showSpark {
-				sparkText = renderSparkline(f, sparkW)
-			}
-		}
-
+		left := indent + marker + " " + name
+		var right string
 		if showSpark {
-			right := sparkText + "  " + coloredStats
-			lines = append(lines, padBetweenAnsi(coloredLeft, right, rowW))
+			right = renderSparklinePlain(f, sparkW) + "  " + statsPlain
 		} else {
-			lines = append(lines, padBetweenAnsi(coloredLeft, coloredStats, rowW))
+			right = statsPlain
 		}
+		return padBetweenPlain(left, right, rowW)
 	}
-	return strings.Join(lines, "\n")
+	return ""
 }
 
 func padBetweenPlain(left, right string, width int) string {
@@ -1138,11 +1277,10 @@ func (m Model) attachSpineColumn(body string) string {
 		}
 		return b.String()
 	}
-	files, _ := m.effectiveFiles()
-	if len(files) == 0 || m.fileCursor >= len(files) {
+	f, _, ok := m.currentFileRow()
+	if !ok {
 		return body
 	}
-	f := files[m.fileCursor]
 	spineRows := renderFileSpine(f, m.viewport.Height, m.currentHunkIndex())
 	if len(spineRows) == 0 {
 		return body
@@ -1187,11 +1325,11 @@ func (m Model) currentFileForContext() diff.File {
 	if m.view != viewChanges {
 		return diff.File{}
 	}
-	files, _ := m.effectiveFiles()
-	if m.fileCursor < 0 || m.fileCursor >= len(files) {
+	f, _, ok := m.currentFileRow()
+	if !ok {
 		return diff.File{}
 	}
-	return files[m.fileCursor]
+	return f
 }
 
 // scheduleContextRefresh bumps the refresh seqno and returns a Cmd that fires
@@ -1223,7 +1361,18 @@ func (m Model) diffTitle() string {
 	if m.view == viewCommits {
 		return d.Label
 	}
-	f := d.Files[m.fileCursor]
+	if m.view == viewChanges {
+		fr, _, ok := m.currentFileRow()
+		if !ok {
+			return "(select a file)"
+		}
+		if fr.Status == diff.StatusRenamed && fr.OldPath != "" && fr.OldPath != fr.Path {
+			return fmt.Sprintf("%s → %s", fr.OldPath, fr.Path)
+		}
+		return fr.Path
+	}
+	// overview and other views — fall back to first file
+	f := d.Files[0]
 	if f.Status == diff.StatusRenamed && f.OldPath != "" && f.OldPath != f.Path {
 		return fmt.Sprintf("%s → %s", f.OldPath, f.Path)
 	}

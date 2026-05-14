@@ -62,18 +62,20 @@ func TestModelNavigation(t *testing.T) {
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
-	// Move cursor down
+	// Move cursor down: starts at 0 (dir row "(root)") → 1 (first file).
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated.(Model)
-	if m.fileCursor != 1 {
-		t.Errorf("cursor after j: got %d want 1", m.fileCursor)
+	if m.rowCursor != 1 {
+		t.Errorf("cursor after j: got %d want 1", m.rowCursor)
 	}
 
-	// Boundary — shouldn't go past last
+	// Move further — 2 files + 1 dir = 3 rows. Last index = 2.
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated.(Model)
-	if m.fileCursor != 1 {
-		t.Errorf("cursor at end after extra j: got %d want 1", m.fileCursor)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(Model)
+	if m.rowCursor != 2 {
+		t.Errorf("cursor at end: got %d want 2", m.rowCursor)
 	}
 
 	// Tab focus
@@ -81,6 +83,24 @@ func TestModelNavigation(t *testing.T) {
 	m = updated.(Model)
 	if m.focus != paneDiff {
 		t.Errorf("focus after tab: got %v want paneDiff", m.focus)
+	}
+}
+
+func TestCurrentFileRow(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Row 0 is the "(root)" dir row.
+	m.rowCursor = 0
+	if _, _, ok := m.currentFileRow(); ok {
+		t.Error("dir row should return ok=false")
+	}
+
+	// Row 1 is the first file.
+	m.rowCursor = 1
+	if f, _, ok := m.currentFileRow(); !ok || f.Path != "main.go" {
+		t.Errorf("file row: ok=%v path=%q want ok=true path=main.go", ok, f.Path)
 	}
 }
 
