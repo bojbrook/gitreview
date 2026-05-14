@@ -72,4 +72,26 @@ var (
 	splitDividerStyle = lipgloss.NewStyle().
 				Foreground(colBorderFocus).
 				Bold(true)
+
+	// contextPaneStyle is the rounded-border box around the third column.
+	contextPaneStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colBorder).
+				Padding(0, 1)
+
+	contextPaneFocusStyle = contextPaneStyle.
+				BorderForeground(colBorderFocus)
+
+	// contextSectionHeaderStyle is the "▸ Where" / "▸ Symbol" label.
+	contextSectionHeaderStyle = lipgloss.NewStyle().
+					Foreground(colBorderFocus).
+					Bold(true)
+
+	contextItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+
+	contextMutedStyle = lipgloss.NewStyle().Foreground(colMuted)
+
+	contextItemSelectedStyle = lipgloss.NewStyle().
+					Background(colCursor).
+					Foreground(lipgloss.Color("15"))
 )

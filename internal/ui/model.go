@@ -1,10 +1,13 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -19,6 +22,7 @@ type pane int
 const (
 	paneLeft pane = iota
 	paneDiff
+	paneContext
 )
 
 type viewMode int
@@ -30,25 +34,31 @@ const (
 )
 
 type Model struct {
-	d            *diff.Diff
-	commits      []diff.Commit
-	commitDiff   map[string]*diff.Diff
-	commitErr    map[string]error
-	repoRoot     string
-	view         viewMode
-	fileCursor   int
-	commitCursor   int
-	overviewCursor int // index into the filtered Files list when in overview view
-	overviewCols   int // computed at render time so j/k can move by row
-	focus          pane
-	splitView      bool
-	hunkOffsets    []int // viewport line indices of each hunk in the current file
-	width        int
-	height       int
-	forcedWidth  int
-	viewport     viewport.Model
-	ready        bool
-	statusMsg    string
+	d                      *diff.Diff
+	commits                []diff.Commit
+	commitDiff             map[string]*diff.Diff
+	commitErr              map[string]error
+	repoRoot               string
+	view                   viewMode
+	fileCursor             int
+	commitCursor           int
+	overviewCursor         int // index into the filtered Files list when in overview view
+	overviewCols           int // computed at render time so j/k can move by row
+	focus                  pane
+	splitView              bool
+	contextPaneVisible     bool // user-toggled; default true
+	contextPayload         ctxpane.Payload
+	contextCursor          ctxpane.Cursor
+	contextSelected        int   // currently highlighted item index when pane is focused
+	contextRefreshSeq      int   // monotonic; used to ignore stale debounced ticks
+	contextHistoryExpanded bool  // toggled by H when pane is focused
+	hunkOffsets            []int // viewport line indices of each hunk in the current file
+	width                  int
+	height                 int
+	forcedWidth            int
+	viewport               viewport.Model
+	ready                  bool
+	statusMsg              string
 
 	// filter state for the file list
 	filterInput     textinput.Model
@@ -74,19 +84,33 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
 	ti.Placeholder = "filter files…"
 	ti.CharLimit = 100
 	return Model{
-		d:             d,
-		commits:       commits,
-		commitDiff:    map[string]*diff.Diff{},
-		commitErr:     map[string]error{},
-		repoRoot:      repoRoot,
-		focus:         paneLeft,
-		filterInput:   ti,
-		reviewedFiles: map[string]bool{},
+		d:                  d,
+		commits:            commits,
+		commitDiff:         map[string]*diff.Diff{},
+		commitErr:          map[string]error{},
+		repoRoot:           repoRoot,
+		focus:              paneLeft,
+		filterInput:        ti,
+		reviewedFiles:      map[string]bool{},
+		contextPaneVisible: true,
 	}
 }
 
 // editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
 type editorDoneMsg struct{ err error }
+
+// contextRefreshMsg is fired by tea.Tick after the debounce window. The Seq
+// must match the model's current contextRefreshSeq, otherwise the tick is
+// stale (a newer move has scheduled a fresher one) and we no-op.
+type contextRefreshMsg struct{ Seq int }
+
+// contextResultMsg carries the computed payload back from the resolver Cmd.
+type contextResultMsg struct {
+	Seq     int
+	Payload ctxpane.Payload
+}
+
+const contextDebounce = 150 * time.Millisecond
 
 func (m Model) Init() tea.Cmd {
 	return nil
@@ -113,9 +137,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.width = m.forcedWidth
 		}
 		m.layout()
+		m.clampFocusToVisiblePanes()
 		m.refreshDiff()
 		m.ready = true
-		return m, nil
+		return m, m.scheduleContextRefresh()
 
 	case tea.KeyMsg:
 		// While the filter input is focused, every key goes to it (except a few escapes).
@@ -126,10 +151,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
-			m.focus = (m.focus + 1) % 2
+			m.focus = m.nextFocus(+1)
 			return m, nil
 		case "shift+tab":
-			m.focus = (m.focus + 1) % 2
+			m.focus = m.nextFocus(-1)
 			return m, nil
 		case "v":
 			m.toggleView()
@@ -146,25 +171,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "j", "down":
 			if m.view == viewOverview {
 				m.moveOverview(0, +1)
+				return m, m.scheduleContextRefresh()
+			}
+			if m.focus == paneContext {
+				m.contextMoveSelection(+1)
 				return m, nil
 			}
 			if m.focus == paneLeft {
-				m.moveCursor(+1)
-				return m, nil
+				return m, m.moveCursor(+1)
 			}
 			m.viewport.ScrollDown(1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "k", "up":
 			if m.view == viewOverview {
 				m.moveOverview(0, -1)
+				return m, m.scheduleContextRefresh()
+			}
+			if m.focus == paneContext {
+				m.contextMoveSelection(-1)
 				return m, nil
 			}
 			if m.focus == paneLeft {
-				m.moveCursor(-1)
-				return m, nil
+				return m, m.moveCursor(-1)
 			}
 			m.viewport.ScrollUp(1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "h", "left":
 			if m.view == viewOverview {
 				m.moveOverview(-1, 0)
@@ -181,35 +212,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == viewOverview {
 				m.fileCursor = m.overviewCursor
 				m.setView(viewChanges)
-				return m, nil
+				return m, m.scheduleContextRefresh()
+			}
+			if m.focus == paneContext {
+				return m, m.contextJumpToSelected()
 			}
 			return m, nil
 		case "g":
 			if m.focus == paneLeft {
-				m.setCursor(0)
-			} else {
-				m.viewport.GotoTop()
+				return m, m.setCursor(0)
 			}
-			return m, nil
+			m.viewport.GotoTop()
+			return m, m.maybeScheduleHunkChange()
 		case "G":
 			if m.focus == paneLeft {
-				m.setCursor(m.maxCursor())
-			} else {
-				m.viewport.GotoBottom()
+				return m, m.setCursor(m.maxCursor())
 			}
-			return m, nil
+			m.viewport.GotoBottom()
+			return m, m.maybeScheduleHunkChange()
 		case "ctrl+d":
 			m.viewport.HalfPageDown()
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "ctrl+u":
 			m.viewport.HalfPageUp()
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "]":
 			m.jumpHunk(+1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "[":
 			m.jumpHunk(-1)
-			return m, nil
+			return m, m.maybeScheduleHunkChange()
 		case "/":
 			if m.view == viewChanges {
 				return m, m.startFiltering()
@@ -218,7 +250,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			if m.filter != "" {
 				m.clearFilter()
+				return m, nil
 			}
+			m.contextPaneVisible = !m.contextPaneVisible
+			m.layout()
+			m.clampFocusToVisiblePanes()
+			m.refreshDiff()
 			return m, nil
 		case "m":
 			m.toggleReviewed()
@@ -231,9 +268,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s":
 			if m.view == viewChanges {
 				m.splitView = !m.splitView
+				m.layout()
+				m.clampFocusToVisiblePanes()
 				m.refreshDiff()
 			} else {
 				m.statusMsg = "split view only available in Changes view"
+			}
+			return m, nil
+		case "H":
+			if m.focus != paneContext {
+				return m, nil
+			}
+			m.contextHistoryExpanded = !m.contextHistoryExpanded
+			return m, m.scheduleContextRefresh()
+		case "esc":
+			if m.focus == paneContext {
+				m.focus = paneDiff
+				return m, nil
 			}
 			return m, nil
 		}
@@ -244,6 +295,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMsg = "edit done — quit and re-run to refresh"
 		}
+		return m, nil
+
+	case contextRefreshMsg:
+		if msg.Seq != m.contextRefreshSeq {
+			return m, nil // stale
+		}
+		cur := ctxpane.Cursor{
+			File:            m.currentFileForContext(),
+			HunkIndex:       m.currentHunkIndex(),
+			Diff:            m.d,
+			RepoRoot:        m.repoRoot,
+			HistoryExpanded: m.contextHistoryExpanded,
+		}
+		m.contextCursor = cur
+		seq := msg.Seq
+		return m, func() tea.Msg {
+			return contextResultMsg{Seq: seq, Payload: ctxpane.Resolve(context.Background(), cur)}
+		}
+
+	case contextResultMsg:
+		if msg.Seq != m.contextRefreshSeq {
+			return m, nil // stale
+		}
+		m.contextPayload = msg.Payload
+		m.contextSelected = 0
 		return m, nil
 	}
 
@@ -323,11 +399,11 @@ func (m Model) View() string {
 	if m.view == viewOverview {
 		body = m.renderOverviewBody()
 	} else {
-		body = lipgloss.JoinHorizontal(
-			lipgloss.Top,
-			m.renderLeftPane(),
-			m.renderDiffPane(),
-		)
+		parts := []string{m.renderLeftPane(), m.renderDiffPane()}
+		if m.contextPaneWidthEffective() > 0 {
+			parts = append(parts, m.renderContextPane())
+		}
+		body = lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderHelp())
 }
@@ -406,6 +482,11 @@ func (m Model) overviewColsAtWidth() int {
 const (
 	headerRows = 1
 	spineColW  = 2 // 1 col spine + 1 col gap inside the diff pane
+)
+
+const (
+	contextPaneWidth   = 32  // fixed width when visible
+	contextPaneMinTerm = 120 // hide entirely below this terminal width
 )
 
 // --- filter ---
@@ -541,7 +622,7 @@ func (m *Model) setView(v viewMode) {
 	m.refreshDiff()
 }
 
-func (m *Model) moveCursor(delta int) {
+func (m *Model) moveCursor(delta int) tea.Cmd {
 	c := m.cursor() + delta
 	if c < 0 {
 		c = 0
@@ -549,7 +630,7 @@ func (m *Model) moveCursor(delta int) {
 	if c > m.maxCursor() {
 		c = m.maxCursor()
 	}
-	m.setCursor(c)
+	return m.setCursor(c)
 }
 
 func (m *Model) cursor() int {
@@ -562,24 +643,32 @@ func (m *Model) cursor() int {
 	return m.fileCursor
 }
 
-func (m *Model) setCursor(c int) {
+func (m *Model) setCursor(c int) tea.Cmd {
+	changed := false
 	switch m.view {
 	case viewCommits:
 		if c != m.commitCursor {
 			m.commitCursor = c
 			m.refreshDiff()
+			changed = true
 		}
 	case viewOverview:
 		if c != m.overviewCursor {
 			m.overviewCursor = c
 			m.refreshDiff()
+			changed = true
 		}
 	default:
 		if c != m.fileCursor {
 			m.fileCursor = c
 			m.refreshDiff()
+			changed = true
 		}
 	}
+	if changed {
+		return m.scheduleContextRefresh()
+	}
+	return nil
 }
 
 func (m *Model) maxCursor() int {
@@ -682,6 +771,81 @@ func (m *Model) moveOverview(dx, dy int) {
 	}
 }
 
+// nextFocus returns the focus target after stepping `dir` (±1) through the
+// pane cycle, skipping panes that are currently hidden. Order: paneLeft →
+// paneDiff → paneContext → paneLeft.
+func (m Model) nextFocus(dir int) pane {
+	order := []pane{paneLeft, paneDiff}
+	if m.contextPaneWidthEffective() > 0 {
+		order = append(order, paneContext)
+	}
+	pos := 0
+	for i, p := range order {
+		if p == m.focus {
+			pos = i
+			break
+		}
+	}
+	pos = (pos + dir + len(order)) % len(order)
+	return order[pos]
+}
+
+// contextSelectableItems returns a flat list of (sectionIdx, itemIdx) pairs
+// for every Item whose Jump is non-nil — the only items the user can act on.
+func (m Model) contextSelectableItems() []struct{ S, I int } {
+	var out []struct{ S, I int }
+	for si, s := range m.contextPayload.Sections {
+		for ii, it := range s.Items {
+			if it.Jump != nil {
+				out = append(out, struct{ S, I int }{si, ii})
+			}
+		}
+	}
+	return out
+}
+
+func (m *Model) contextMoveSelection(delta int) {
+	n := len(m.contextSelectableItems())
+	if n == 0 {
+		return
+	}
+	m.contextSelected = (m.contextSelected + delta + n) % n
+}
+
+// contextJumpToSelected moves the diff cursor to the file the selected pane
+// item points at. Returns a Cmd that triggers a context refresh.
+func (m *Model) contextJumpToSelected() tea.Cmd {
+	items := m.contextSelectableItems()
+	if len(items) == 0 || m.contextSelected < 0 || m.contextSelected >= len(items) {
+		return nil
+	}
+	pos := items[m.contextSelected]
+	it := m.contextPayload.Sections[pos.S].Items[pos.I]
+	if it.Jump == nil {
+		return nil
+	}
+	files, _ := m.effectiveFiles()
+	for i, f := range files {
+		if f.Path == it.Jump.File {
+			m.fileCursor = i
+			m.refreshDiff()
+			break
+		}
+	}
+	// We don't scroll the viewport to it.Jump.Line — viewport line math is
+	// non-trivial. File-level jump is the v0 promise.
+	return m.scheduleContextRefresh()
+}
+
+// clampFocusToVisiblePanes ensures focus never points at the hidden context
+// pane. Call this after any change that may hide the pane (toggle, split,
+// resize).
+func (m *Model) clampFocusToVisiblePanes() {
+	if m.focus == paneContext && m.contextPaneWidthEffective() == 0 {
+		m.focus = paneDiff
+	}
+}
+
 // --- layout ---
 
 const (
@@ -695,7 +859,8 @@ func (m *Model) layout() {
 	}
 	bodyH := m.height - headerRows - helpHeight
 	leftW := int(float64(m.width) * leftRatio)
-	centerW := m.width - leftW
+	contextW := m.contextPaneWidthEffective()
+	centerW := m.width - leftW - contextW
 	// Reserve 2 cols on the right of the diff pane for the file-spine column
 	// (1 col spine + 1 col gap). Empty in commits view but keeps layout stable.
 	innerW := centerW - 4 - spineColW
@@ -707,6 +872,22 @@ func (m *Model) layout() {
 		m.viewport.Width = innerW
 		m.viewport.Height = innerH
 	}
+}
+
+// contextPaneWidthEffective returns 0 when the pane is hidden (user toggled it
+// off, split view forces it off, or terminal too narrow); otherwise the fixed
+// pane width.
+func (m Model) contextPaneWidthEffective() int {
+	if !m.contextPaneVisible {
+		return 0
+	}
+	if m.splitView {
+		return 0
+	}
+	if m.width < contextPaneMinTerm {
+		return 0
+	}
+	return contextPaneWidth
 }
 
 func (m *Model) refreshDiff() {
@@ -771,9 +952,10 @@ func (m *Model) currentDiff() *diff.Diff {
 
 // --- panes ---
 
-func (m Model) paneWidths() (left, center int) {
+func (m Model) paneWidths() (left, center, context int) {
 	left = int(float64(m.width) * leftRatio)
-	center = m.width - left
+	context = m.contextPaneWidthEffective()
+	center = m.width - left - context
 	return
 }
 
@@ -786,7 +968,7 @@ func (m Model) paneStyleFor(p pane, w, h int) lipgloss.Style {
 }
 
 func (m Model) renderLeftPane() string {
-	leftW, _ := m.paneWidths()
+	leftW, _, _ := m.paneWidths()
 	bodyH := m.height - headerRows - helpHeight
 
 	var listContent string
@@ -915,7 +1097,7 @@ func (m Model) renderCommitsList(leftW int) string {
 }
 
 func (m Model) renderDiffPane() string {
-	_, centerW := m.paneWidths()
+	_, centerW, _ := m.paneWidths()
 	bodyH := m.height - headerRows - helpHeight
 	header := titleStyle.Render(m.diffTitle())
 	body := m.attachSpineColumn(m.viewport.View())
@@ -983,6 +1165,40 @@ func (m Model) currentHunkIndex() int {
 	return active
 }
 
+// currentFileForContext returns the file the context pane should describe,
+// or a zero-value File if no file is selected.
+func (m Model) currentFileForContext() diff.File {
+	if m.view != viewChanges {
+		return diff.File{}
+	}
+	files, _ := m.effectiveFiles()
+	if m.fileCursor < 0 || m.fileCursor >= len(files) {
+		return diff.File{}
+	}
+	return files[m.fileCursor]
+}
+
+// scheduleContextRefresh bumps the refresh seqno and returns a Cmd that fires
+// a contextRefreshMsg after the debounce window. Callers should compose this
+// with any other Cmd they return.
+func (m *Model) scheduleContextRefresh() tea.Cmd {
+	m.contextRefreshSeq++
+	seq := m.contextRefreshSeq
+	return tea.Tick(contextDebounce, func(time.Time) tea.Msg {
+		return contextRefreshMsg{Seq: seq}
+	})
+}
+
+// maybeScheduleHunkChange returns a refresh Cmd if the current hunk index
+// has changed since the last context refresh.
+func (m *Model) maybeScheduleHunkChange() tea.Cmd {
+	newHunk := m.currentHunkIndex()
+	if newHunk == m.contextCursor.HunkIndex {
+		return nil
+	}
+	return m.scheduleContextRefresh()
+}
+
 func (m Model) diffTitle() string {
 	d := m.currentDiffReadonly()
 	if d == nil || len(d.Files) == 0 {
@@ -1021,6 +1237,8 @@ func (m Model) renderHelp() string {
 	parts := []string{"j/k file", "]/[ hunk", "m mark", "M next-unreviewed", "/ filter", "1/2/3 tab", splitHint, "e edit", "q quit"}
 	if m.filter != "" {
 		parts = append([]string{"c clear-filter"}, parts...)
+	} else {
+		parts = append(parts, "c ctx")
 	}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {
@@ -1053,13 +1271,17 @@ func compactPath(p string, maxW int) string {
 }
 
 func truncateRaw(s string, maxW int) string {
-	if maxW <= 0 || len(s) <= maxW {
+	if maxW <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxW {
 		return s
 	}
 	if maxW < 2 {
-		return s[:maxW]
+		return string(runes[:maxW])
 	}
-	return s[:maxW-1] + "…"
+	return string(runes[:maxW-1]) + "…"
 }
 
 // truncateAnsi cuts a string with embedded ANSI escapes to maxW visible columns,

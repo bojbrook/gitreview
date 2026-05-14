@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -80,5 +81,185 @@ func TestModelNavigation(t *testing.T) {
 	m = updated.(Model)
 	if m.focus != paneDiff {
 		t.Errorf("focus after tab: got %v want paneDiff", m.focus)
+	}
+}
+
+func TestContextPaneVisibleByDefault(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if !m.contextPaneVisible {
+		t.Error("contextPaneVisible: got false want true")
+	}
+	if m.contextPaneWidthEffective() == 0 {
+		t.Error("contextPaneWidthEffective: got 0 at width=140")
+	}
+	// Context pane populates via the async path. Drive it by delivering a
+	// contextRefreshMsg (which returns a Cmd), then calling that Cmd to get the
+	// contextResultMsg, then delivering that.
+	updated, cmd := m.Update(contextRefreshMsg{Seq: m.contextRefreshSeq})
+	m = updated.(Model)
+	if cmd != nil {
+		if resultMsg := cmd(); resultMsg != nil {
+			updated, _ = m.Update(resultMsg)
+			m = updated.(Model)
+		}
+	}
+	if !strings.Contains(m.View(), "Where") {
+		t.Errorf("View missing context section. Got:\n%s", m.View())
+	}
+}
+
+func TestContextPaneHiddenBelow120Cols(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	if m.contextPaneWidthEffective() != 0 {
+		t.Errorf("contextPaneWidthEffective at 100 cols: got %d want 0", m.contextPaneWidthEffective())
+	}
+}
+
+func TestContextPaneToggleWithC(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if !m.contextPaneVisible {
+		t.Error("initial: pane should be visible")
+	}
+	// Toggle off with c
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(Model)
+	if m.contextPaneVisible {
+		t.Error("after first c: pane should be hidden")
+	}
+	// Toggle back on with c
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(Model)
+	if !m.contextPaneVisible {
+		t.Error("after second c: pane should be visible again")
+	}
+}
+
+func TestContextPaneHiddenInSplitView(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if m.contextPaneWidthEffective() != 0 {
+		t.Error("split view should hide context pane")
+	}
+}
+
+func TestContextRefreshStaleCancel(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+
+	// Prime a known payload so we can detect overwrites.
+	m.contextPayload = ctxpane.Payload{
+		Sections: []ctxpane.Section{{Kind: ctxpane.SectionWhere, Status: ctxpane.StatusOK, Items: []ctxpane.Item{{Text: "sentinel"}}}},
+	}
+
+	// Schedule two refreshes back to back; the first should be stale.
+	_ = m.scheduleContextRefresh()
+	staleSeq := m.contextRefreshSeq
+	_ = m.scheduleContextRefresh()
+
+	// Delivering the stale msg must not crash and must not replace the payload.
+	updated, _ = m.Update(contextRefreshMsg{Seq: staleSeq})
+	m = updated.(Model)
+	if m.contextRefreshSeq != staleSeq+1 {
+		t.Errorf("contextRefreshSeq: got %d want %d", m.contextRefreshSeq, staleSeq+1)
+	}
+	if len(m.contextPayload.Sections) == 0 || m.contextPayload.Sections[0].Items[0].Text != "sentinel" {
+		t.Errorf("stale msg overwrote payload; sections=%+v", m.contextPayload.Sections)
+	}
+}
+
+func TestContextHistoryToggleWithH(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if m.contextHistoryExpanded {
+		t.Fatal("expected contextHistoryExpanded false initially")
+	}
+	// Task 9 wires Tab into paneContext; here we set focus directly so this
+	// test works against the build state at the end of Task 8.
+	m.focus = paneContext
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+	m = updated.(Model)
+	if !m.contextHistoryExpanded {
+		t.Error("after H: contextHistoryExpanded should be true")
+	}
+}
+
+func TestContextHistoryHIgnoredWithoutPaneFocus(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	// focus is paneLeft — H should be ignored.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+	m = updated.(Model)
+	if m.contextHistoryExpanded {
+		t.Error("H without pane focus should be a no-op")
+	}
+}
+
+func TestContextFocusCycle(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Fatal("initial focus should be paneLeft")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Errorf("after tab: got %v want paneDiff", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneContext {
+		t.Errorf("after second tab: got %v want paneContext", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Errorf("after third tab: got %v want paneLeft (wrapped)", m.focus)
+	}
+}
+
+func TestContextFocusSkipsHiddenPane(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30}) // < 120: pane hidden
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Errorf("after tab: got %v want paneDiff", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Errorf("after second tab: got %v want paneLeft (pane hidden, skipped)", m.focus)
+	}
+}
+
+func TestContextEscReturnsFocusToDiff(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneContext {
+		t.Fatalf("setup: focus should be paneContext, got %v", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Errorf("after esc: got %v want paneDiff", m.focus)
 	}
 }
