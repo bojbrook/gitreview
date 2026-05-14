@@ -358,3 +358,47 @@ func TestHJumpsToParent(t *testing.T) {
 		t.Errorf("h on file row: cursor=%d want 0 (parent dir)", m.rowCursor)
 	}
 }
+
+func TestMarkReviewedNoOpOnDirRow(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	m.rowCursor = 0 // dir row
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = updated.(Model)
+	if len(m.reviewedFiles) != 0 {
+		t.Errorf("m on dir row should not toggle reviewed; got %d entries", len(m.reviewedFiles))
+	}
+	if m.statusMsg == "" {
+		t.Error("m on dir row should set a status hint")
+	}
+}
+
+func TestMarkReviewedTogglesOnFileRow(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	m.rowCursor = 1 // first file row
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = updated.(Model)
+	if !m.reviewedFiles["main.go"] {
+		t.Errorf("m on file row should mark reviewed; reviewedFiles=%v", m.reviewedFiles)
+	}
+}
+
+func TestNextUnreviewedWalksFileRowsOnly(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Mark first file reviewed, then jump-to-next from the first file row.
+	m.reviewedFiles["main.go"] = true
+	m.rowCursor = 1 // first file (already reviewed)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}})
+	m = updated.(Model)
+	if m.rowCursor != 2 {
+		t.Errorf("M: cursor=%d want 2 (next file)", m.rowCursor)
+	}
+}

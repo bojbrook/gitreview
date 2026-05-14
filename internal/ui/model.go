@@ -385,7 +385,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) openInEditor() tea.Cmd {
 	f, line, ok := m.selectedEditTarget()
 	if !ok {
-		m.statusMsg = "nothing to edit here"
+		if r := m.rowAtCursor(); r.Kind == rowDir {
+			m.statusMsg = "e: select a file to open"
+		} else {
+			m.statusMsg = "nothing to edit here"
+		}
 		return nil
 	}
 	if m.repoRoot == "" {
