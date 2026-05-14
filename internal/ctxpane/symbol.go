@@ -62,7 +62,6 @@ func gitGrepRefs(ctx context.Context, repoRoot, symbol, excludePath string, maxR
 		if line == "" {
 			continue
 		}
-		// Format is "path:lineno:content" — we only keep the prefix.
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) < 2 {
 			continue
@@ -90,20 +89,6 @@ func filterAndCap(refs []string, excludePath string, maxResults int) []string {
 	return out
 }
 
-func escapeRegex(s string) string {
-	// Conservative escape — these are the metachars git-grep -E will react to.
-	const meta = `\.+*?()[]{}|^$`
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		if strings.ContainsRune(meta, r) {
-			b.WriteByte('\\')
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}
-
 func buildSymbolSection(ctx context.Context, cur Cursor) Section {
 	s := Section{Kind: SectionSymbol, Status: StatusEmpty}
 	sym := symbolUnderCursor(cur)
@@ -116,8 +101,11 @@ func buildSymbolSection(ctx context.Context, cur Cursor) Section {
 		return s
 	}
 	s.Status = StatusOK
-	header := fmt.Sprintf("%s (%d refs)", sym, len(refs))
-	s.Items = []Item{{Text: header}}
+	if len(refs) == 0 {
+		s.Items = []Item{{Text: sym + " (no other refs)"}}
+		return s
+	}
+	s.Items = []Item{{Text: fmt.Sprintf("%s (%s)", sym, plural(len(refs), "ref"))}}
 	for _, r := range refs {
 		parts := strings.SplitN(r, ":", 2)
 		ln, _ := strconv.Atoi(parts[1])
@@ -126,9 +114,13 @@ func buildSymbolSection(ctx context.Context, cur Cursor) Section {
 			Jump: &JumpTarget{File: parts[0], Line: ln},
 		})
 	}
-	// Avoid leaving the section empty when sym matches but has no refs.
-	if len(refs) == 0 {
-		s.Items[0] = Item{Text: sym + " (no other refs)"}
-	}
 	return s
+}
+
+// plural formats a count with a noun, pluralising with a trailing 's' when n != 1.
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

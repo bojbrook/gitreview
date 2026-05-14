@@ -84,16 +84,3 @@ func TestBuildSymbolSection_Integration(t *testing.T) {
 		t.Errorf("expected main.go in symbol refs; got %+v", s.Items)
 	}
 }
-
-func TestEscapeRegex(t *testing.T) {
-	cases := map[string]string{
-		"foo":     "foo",
-		"foo.bar": `foo\.bar`,
-		"a(b)":    `a\(b\)`,
-	}
-	for in, want := range cases {
-		if got := escapeRegex(in); got != want {
-			t.Errorf("escapeRegex(%q): got %q want %q", in, got, want)
-		}
-	}
-}
