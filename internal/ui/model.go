@@ -878,7 +878,6 @@ func (m *Model) contextJumpToSelected() tea.Cmd {
 	if it.Jump == nil {
 		return nil
 	}
-	// Check that the target file is in the diff before jumping.
 	files, _ := m.effectiveFiles()
 	inDiff := false
 	for _, f := range files {
@@ -888,6 +887,8 @@ func (m *Model) contextJumpToSelected() tea.Cmd {
 		}
 	}
 	if inDiff {
+		// First refresh: rebuild treeRows so RowOfFile can find the target row.
+		// Second refresh: re-render the diff for the new rowCursor.
 		m.refreshDiff()
 		if row := RowOfFile(m.treeRows, it.Jump.File); row >= 0 {
 			m.rowCursor = row
@@ -981,13 +982,12 @@ func (m *Model) refreshDiff() {
 			m.hunkOffsets = nil
 			return
 		}
-		f := fr
 		if m.splitView {
-			m.viewport.SetContent(renderSplit(f, m.viewport.Width))
-			m.hunkOffsets = hunkOffsetsSplit(f)
+			m.viewport.SetContent(renderSplit(fr, m.viewport.Width))
+			m.hunkOffsets = hunkOffsetsSplit(fr)
 		} else {
-			m.viewport.SetContent(renderDiff(f, m.viewport.Width))
-			m.hunkOffsets = hunkOffsetsUnified(f)
+			m.viewport.SetContent(renderDiff(fr, m.viewport.Width))
+			m.hunkOffsets = hunkOffsetsUnified(fr)
 		}
 	} else {
 		if len(d.Files) == 0 {
@@ -1084,6 +1084,7 @@ func (m Model) renderFilesList(leftW int) string {
 
 	const sparkW = 6
 	showSpark := rowW >= 30
+	files, _ := m.effectiveFiles()
 
 	for i, r := range m.treeRows {
 		var rendered string
@@ -1091,7 +1092,6 @@ func (m Model) renderFilesList(leftW int) string {
 		case rowDir:
 			rendered = renderTreeDir(r, m.treeCollapsed[r.Path], rowW)
 		case rowFile:
-			files, _ := m.effectiveFiles()
 			if r.FileIdx < 0 || r.FileIdx >= len(files) {
 				continue
 			}
@@ -1144,15 +1144,12 @@ func renderTreeFile(r treeRow, f diff.File, reviewed bool, showSpark bool, spark
 	}
 	name := compactPath(r.Label, nameMaxW)
 
-	var marker string
-	if reviewed {
-		marker = "✓"
-	} else {
-		marker = statusMarker(f.Status)
-	}
-	left := indent + marker + " " + name
+	var left string
 	if reviewed {
 		left = mutedStyle.Render(indent + "✓ " + name)
+	} else {
+		marker := statusMarker(f.Status)
+		left = indent + marker + " " + name
 	}
 	var right string
 	if showSpark {
@@ -1167,60 +1164,21 @@ func renderTreeFile(r treeRow, f diff.File, reviewed bool, showSpark bool, spark
 	return padBetweenAnsi(left, right, rowW)
 }
 
-// stripAnsiForCursor builds the plain (no-ANSI) version of a row for the
-// cursor highlight (cursorStyle's background needs uniform text underneath).
+// stripAnsiForCursor returns the row's rendered text with ANSI escapes
+// removed. cursorStyle's background applies a uniform highlight, so any
+// nested escape codes inside its argument would visually fight the bg.
 func stripAnsiForCursor(r treeRow, m Model, rowW, sparkW int, showSpark bool) string {
 	switch r.Kind {
 	case rowDir:
-		marker := "▾ "
-		if m.treeCollapsed[r.Path] {
-			marker = "▸ "
-		}
-		left := marker + r.Label
-		var right string
-		if r.Total > 0 {
-			if r.Reviewed == r.Total {
-				right = "✓"
-			} else if r.Reviewed > 0 {
-				right = fmt.Sprintf("✓ %d/%d", r.Reviewed, r.Total)
-			}
-		}
-		if right == "" {
-			return padBetweenPlain(left, "", rowW)
-		}
-		return padBetweenPlain(left, right, rowW)
+		return ansi.Strip(renderTreeDir(r, m.treeCollapsed[r.Path], rowW))
 	case rowFile:
 		files, _ := m.effectiveFiles()
 		if r.FileIdx < 0 || r.FileIdx >= len(files) {
 			return ""
 		}
 		f := files[r.FileIdx]
-		const indent = "  │ "
 		reviewed := m.reviewedFiles[f.Path]
-		statsPlain := formatFileStats(f)
-		reserve := len(indent) + 3 + len(statsPlain)
-		if showSpark {
-			reserve += sparkW + 2
-		}
-		nameMaxW := rowW - reserve
-		if nameMaxW < 4 {
-			nameMaxW = 4
-		}
-		name := compactPath(r.Label, nameMaxW)
-		var marker string
-		if reviewed {
-			marker = "✓"
-		} else {
-			marker = f.Status.String()
-		}
-		left := indent + marker + " " + name
-		var right string
-		if showSpark {
-			right = renderSparklinePlain(f, sparkW) + "  " + statsPlain
-		} else {
-			right = statsPlain
-		}
-		return padBetweenPlain(left, right, rowW)
+		return ansi.Strip(renderTreeFile(r, f, reviewed, showSpark, sparkW, rowW))
 	}
 	return ""
 }
