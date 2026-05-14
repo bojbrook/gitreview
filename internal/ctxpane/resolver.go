@@ -22,6 +22,7 @@ func Resolve(ctx context.Context, cur Cursor) Payload {
 	tasks := []func(context.Context) Section{
 		func(c context.Context) Section { return buildWhereSection(cur) },
 		func(c context.Context) Section { return buildSymbolSection(c, cur) },
+		func(c context.Context) Section { return buildCrossFileSection(c, cur) },
 		func(c context.Context) Section { return buildBlameSection(c, cur) },
 	}
 	out := make([]Section, len(tasks))
@@ -69,9 +70,9 @@ func kindFor(i int) SectionKind {
 	case 1:
 		return SectionSymbol
 	case 2:
-		return SectionBlame
-	case 3:
 		return SectionCrossFile
+	case 3:
+		return SectionBlame
 	case 4:
 		return SectionHistory
 	}
