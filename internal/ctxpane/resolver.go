@@ -2,6 +2,7 @@ package ctxpane
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -57,8 +58,9 @@ func Resolve(ctx context.Context, cur Cursor) Payload {
 	return Payload{Sections: sections}
 }
 
-// kindFor returns the SectionKind associated with task index i. Keep this in
-// the same order as the tasks slice in Resolve.
+// kindFor maps a task-slice index to the SectionKind it produces. Must be
+// kept in sync with the tasks slice in Resolve. Panics on unknown index to
+// fail loudly rather than silently mislabel a section.
 func kindFor(i int) SectionKind {
 	switch i {
 	case 0:
@@ -72,5 +74,5 @@ func kindFor(i int) SectionKind {
 	case 4:
 		return SectionHistory
 	}
-	return SectionWhere
+	panic(fmt.Sprintf("kindFor: no SectionKind for task index %d — update kindFor when adding tasks", i))
 }

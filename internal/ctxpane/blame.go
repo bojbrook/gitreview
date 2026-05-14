@@ -14,8 +14,8 @@ import (
 var blameCache = newLRU(512)
 
 // blameLine returns a one-line summary like "dbe587b 2d ago — reviewed marks"
-// for the given file:line. Cached by (file, line, HEAD-sha); HEAD sha lookup
-// is done once at startup of the resolver per call.
+// for the given file:line. Cached by (HEAD-sha, file, line). The headSHA is
+// resolved on first call and cached in headShaCache.
 func blameLine(ctx context.Context, repoRoot, file string, line int, headSHA string) (string, error) {
 	key := headSHA + ":" + file + ":" + strconv.Itoa(line)
 	if v, ok := blameCache.Get(key); ok {
@@ -34,7 +34,7 @@ func blameLine(ctx context.Context, repoRoot, file string, line int, headSHA str
 	if short == "" {
 		return "", fmt.Errorf("could not parse blame output")
 	}
-	formatted := fmt.Sprintf("%s %s — %s", short, age, subject)
+	formatted := formatBlameLine(short, age, subject)
 	blameCache.Put(key, formatted)
 	return formatted, nil
 }
@@ -73,7 +73,27 @@ func parseBlamePorcelain(out string) (short, age, subject string) {
 	return
 }
 
+// formatBlameLine renders the one-line blame summary, gracefully omitting
+// fields that came back empty (rare, but happens when porcelain output is
+// truncated or author-time is missing).
+func formatBlameLine(short, age, subject string) string {
+	var b strings.Builder
+	b.WriteString(short)
+	if age != "" {
+		b.WriteString(" ")
+		b.WriteString(age)
+	}
+	if subject != "" {
+		b.WriteString(" — ")
+		b.WriteString(subject)
+	}
+	return b.String()
+}
+
 func humanAge(seconds int64) string {
+	if seconds < 0 {
+		seconds = 0
+	}
 	switch {
 	case seconds < 90:
 		return fmt.Sprintf("%ds", seconds)
@@ -108,7 +128,11 @@ func buildBlameSection(ctx context.Context, cur Cursor) Section {
 		}
 	}
 
-	headSHA, _ := resolveHEADSha(ctx, cur.RepoRoot)
+	headSHA, err := resolveHEADSha(ctx, cur.RepoRoot)
+	if err != nil {
+		s.Status = StatusError
+		return s
+	}
 	line, err := blameLine(ctx, cur.RepoRoot, cur.File.Path, anchor, headSHA)
 	if err != nil {
 		s.Status = StatusError
