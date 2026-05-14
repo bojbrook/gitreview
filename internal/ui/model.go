@@ -34,30 +34,30 @@ const (
 )
 
 type Model struct {
-	d            *diff.Diff
-	commits      []diff.Commit
-	commitDiff   map[string]*diff.Diff
-	commitErr    map[string]error
-	repoRoot     string
-	view         viewMode
-	fileCursor   int
-	commitCursor   int
-	overviewCursor int // index into the filtered Files list when in overview view
-	overviewCols   int // computed at render time so j/k can move by row
-	focus          pane
-	splitView      bool
-	contextPaneVisible bool          // user-toggled; default true
+	d                  *diff.Diff
+	commits            []diff.Commit
+	commitDiff         map[string]*diff.Diff
+	commitErr          map[string]error
+	repoRoot           string
+	view               viewMode
+	fileCursor         int
+	commitCursor       int
+	overviewCursor     int // index into the filtered Files list when in overview view
+	overviewCols       int // computed at render time so j/k can move by row
+	focus              pane
+	splitView          bool
+	contextPaneVisible bool // user-toggled; default true
 	contextPayload     ctxpane.Payload
 	contextCursor      ctxpane.Cursor
-	contextSelected    int           // currently highlighted item index when pane is focused
-	contextRefreshSeq  int           // monotonic; used to ignore stale debounced ticks
-	hunkOffsets    []int // viewport line indices of each hunk in the current file
-	width        int
-	height       int
-	forcedWidth  int
-	viewport     viewport.Model
-	ready        bool
-	statusMsg    string
+	contextSelected    int   // currently highlighted item index when pane is focused
+	contextRefreshSeq  int   // monotonic; used to ignore stale debounced ticks
+	hunkOffsets        []int // viewport line indices of each hunk in the current file
+	width              int
+	height             int
+	forcedWidth        int
+	viewport           viewport.Model
+	ready              bool
+	statusMsg          string
 
 	// filter state for the file list
 	filterInput     textinput.Model
@@ -136,6 +136,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.width = m.forcedWidth
 		}
 		m.layout()
+		m.clampFocusToVisiblePanes()
 		m.refreshDiff()
 		m.ready = true
 		return m, m.scheduleContextRefresh()
@@ -250,10 +251,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.contextPaneVisible = !m.contextPaneVisible
-			if !m.contextPaneVisible && m.focus == paneContext {
-				m.focus = paneDiff
-			}
 			m.layout()
+			m.clampFocusToVisiblePanes()
 			m.refreshDiff()
 			return m, nil
 		case "m":
@@ -267,6 +266,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s":
 			if m.view == viewChanges {
 				m.splitView = !m.splitView
+				m.layout()
+				m.clampFocusToVisiblePanes()
 				m.refreshDiff()
 			} else {
 				m.statusMsg = "split view only available in Changes view"
@@ -755,6 +756,15 @@ func (m *Model) moveOverview(dx, dy int) {
 	}
 }
 
+// clampFocusToVisiblePanes ensures focus never points at the hidden context
+// pane. Call this after any change that may hide the pane (toggle, split,
+// resize).
+func (m *Model) clampFocusToVisiblePanes() {
+	if m.focus == paneContext && m.contextPaneWidthEffective() == 0 {
+		m.focus = paneDiff
+	}
+}
+
 // --- layout ---
 
 const (
@@ -833,13 +843,17 @@ func (m *Model) refreshDiff() {
 		m.viewport.SetContent(renderFullDiff(d.Files, m.viewport.Width))
 		m.hunkOffsets = nil
 	}
-	m.contextPayload = ctxpane.Resolve(context.Background(), ctxpane.Cursor{
-		File:      m.currentFileForContext(),
-		HunkIndex: m.currentHunkIndex(),
-		Diff:      m.d,
-		RepoRoot:  m.repoRoot,
-	})
-	m.contextSelected = 0
+	if m.contextPaneVisible && m.contextPaneWidthEffective() > 0 {
+		cur := ctxpane.Cursor{
+			File:      m.currentFileForContext(),
+			HunkIndex: m.currentHunkIndex(),
+			Diff:      m.d,
+			RepoRoot:  m.repoRoot,
+		}
+		m.contextPayload = ctxpane.Resolve(context.Background(), cur)
+		m.contextCursor = cur
+		m.contextSelected = 0
+	}
 	m.viewport.GotoTop()
 }
 
@@ -1153,6 +1167,8 @@ func (m Model) renderHelp() string {
 	parts := []string{"j/k file", "]/[ hunk", "m mark", "M next-unreviewed", "/ filter", "1/2/3 tab", splitHint, "e edit", "q quit"}
 	if m.filter != "" {
 		parts = append([]string{"c clear-filter"}, parts...)
+	} else {
+		parts = append(parts, "c ctx")
 	}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {
@@ -1185,13 +1201,17 @@ func compactPath(p string, maxW int) string {
 }
 
 func truncateRaw(s string, maxW int) string {
-	if maxW <= 0 || len(s) <= maxW {
+	if maxW <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxW {
 		return s
 	}
 	if maxW < 2 {
-		return s[:maxW]
+		return string(runes[:maxW])
 	}
-	return s[:maxW-1] + "…"
+	return string(runes[:maxW-1]) + "…"
 }
 
 // truncateAnsi cuts a string with embedded ANSI escapes to maxW visible columns,

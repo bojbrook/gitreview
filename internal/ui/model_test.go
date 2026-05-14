@@ -149,12 +149,15 @@ func TestContextRefreshStaleCancel(t *testing.T) {
 	staleSeq := m.contextRefreshSeq
 	_ = m.scheduleContextRefresh()
 
-	// Deliver the stale msg.
+	// Snapshot the payload before delivering the stale msg.
+	want := m.contextPayload
 	updated, _ = m.Update(contextRefreshMsg{Seq: staleSeq})
 	m = updated.(Model)
-	// No assertion about side effects — the test just confirms the model
-	// doesn't crash and doesn't replace the payload from a stale tick.
+	// Stale msg must not crash and must not replace the payload.
 	if m.contextRefreshSeq != staleSeq+1 {
 		t.Errorf("contextRefreshSeq: got %d want %d", m.contextRefreshSeq, staleSeq+1)
+	}
+	if &m.contextPayload.Sections == nil && want.Sections != nil {
+		t.Error("stale msg cleared the payload")
 	}
 }

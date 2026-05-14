@@ -30,7 +30,9 @@ func containingDecl(lines []string, anchorLine int) (name string, line int) {
 		if m == nil {
 			continue
 		}
-		// Prefer group 1 (func/def/class style); fall back to group 2 (assignment style).
+		// Three regex alternation branches each capture into a different group:
+		// 1 = func (with optional Go receiver), 2 = def/class/function/fn, 3 = assignment style.
+		// Return the first non-empty group.
 		for _, g := range m[1:] {
 			if g != "" {
 				return g, i + 1
