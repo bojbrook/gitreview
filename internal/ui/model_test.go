@@ -263,3 +263,16 @@ func TestContextEscReturnsFocusToDiff(t *testing.T) {
 		t.Errorf("after esc: got %v want paneDiff", m.focus)
 	}
 }
+
+func TestRefreshDiffBuildsTree(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if len(m.treeRows) == 0 {
+		t.Fatal("treeRows should be populated after WindowSizeMsg (which refreshes)")
+	}
+	// fakeDiff has files at root (main.go, added.go) → one "(root)" dir row + 2 file rows.
+	if m.treeRows[0].Kind != rowDir {
+		t.Errorf("row 0: got %+v want dir", m.treeRows[0])
+	}
+}

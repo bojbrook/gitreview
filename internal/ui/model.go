@@ -66,6 +66,12 @@ type Model struct {
 	filter          string // committed substring filter (empty = no filter)
 	cursorPreFilter int    // fileCursor before filter began, restored on clear
 
+	// tree state for the file explorer (Changes view).
+	treeRows           []treeRow
+	treeCollapsed      map[string]bool
+	preFilterCollapsed map[string]bool // snapshot on filter start, restored on clear
+	pathPreFilter      string          // file under cursor when filter started; restored on clear
+
 	// reviewed marks — files the user has explicitly marked as walked-through.
 	// Keyed by file path. Persists for the lifetime of the program; not stored
 	// to disk yet.
@@ -93,6 +99,7 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
 		filterInput:        ti,
 		reviewedFiles:      map[string]bool{},
 		contextPaneVisible: true,
+		treeCollapsed:      map[string]bool{},
 	}
 }
 
@@ -924,6 +931,15 @@ func (m *Model) refreshDiff() {
 		m.viewport.SetContent(renderFullDiff(d.Files, m.viewport.Width))
 		m.hunkOffsets = nil
 	}
+
+	// Rebuild the file-explorer tree for the Changes view.
+	if m.view == viewChanges {
+		files, _ := m.effectiveFiles()
+		m.treeRows = BuildTree(files, m.reviewedFiles, m.treeCollapsed, m.filter)
+	} else {
+		m.treeRows = nil
+	}
+
 	m.viewport.GotoTop()
 }
 
