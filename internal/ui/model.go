@@ -257,7 +257,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.setView(viewChanges)
 				}
-				return m, nil
+				return m, m.scheduleContextRefresh()
 			}
 			if m.focus == paneContext {
 				return m, m.contextJumpToSelected()
