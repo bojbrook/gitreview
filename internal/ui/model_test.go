@@ -190,3 +190,61 @@ func TestContextHistoryHIgnoredWithoutPaneFocus(t *testing.T) {
 		t.Error("H without pane focus should be a no-op")
 	}
 }
+
+func TestContextFocusCycle(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Fatal("initial focus should be paneLeft")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Errorf("after tab: got %v want paneDiff", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneContext {
+		t.Errorf("after second tab: got %v want paneContext", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Errorf("after third tab: got %v want paneLeft (wrapped)", m.focus)
+	}
+}
+
+func TestContextFocusSkipsHiddenPane(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30}) // < 120: pane hidden
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Errorf("after tab: got %v want paneDiff", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Errorf("after second tab: got %v want paneLeft (pane hidden, skipped)", m.focus)
+	}
+}
+
+func TestContextEscReturnsFocusToDiff(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneContext {
+		t.Fatalf("setup: focus should be paneContext, got %v", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Errorf("after esc: got %v want paneDiff", m.focus)
+	}
+}

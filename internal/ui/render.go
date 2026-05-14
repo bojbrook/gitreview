@@ -699,12 +699,20 @@ func (m Model) renderContextPane() string {
 		style = contextPaneFocusStyle
 	}
 
+	// Build a set of (sectionIdx, itemIdx) → selectable-position mappings so
+	// we can highlight the right item when the pane is focused.
+	selectablePos := map[[2]int]int{}
+	if m.focus == paneContext {
+		for pos, ref := range m.contextSelectableItems() {
+			selectablePos[[2]int{ref.S, ref.I}] = pos
+		}
+	}
+
 	var lines []string
 	if len(m.contextPayload.Sections) == 0 {
 		lines = append(lines, contextMutedStyle.Render("(no context)"))
 	}
-	idx := 0
-	for _, s := range m.contextPayload.Sections {
+	for si, s := range m.contextPayload.Sections {
 		if s.Status == ctxpane.StatusEmpty || (len(s.Items) == 0 && s.Status != ctxpane.StatusLoading && s.Status != ctxpane.StatusError) {
 			continue
 		}
@@ -715,20 +723,18 @@ func (m Model) renderContextPane() string {
 		switch s.Status {
 		case ctxpane.StatusLoading:
 			lines = append(lines, contextMutedStyle.Render("  …"))
-			idx++
 		case ctxpane.StatusError:
 			lines = append(lines, contextMutedStyle.Render("  (error)"))
-			idx++
 		default:
-			for _, it := range s.Items {
+			for ii, it := range s.Items {
 				row := "  " + truncateRaw(it.Text, innerW-2)
-				if m.focus == paneContext && idx == m.contextSelected {
+				selPos, isSelectable := selectablePos[[2]int{si, ii}]
+				if m.focus == paneContext && isSelectable && selPos == m.contextSelected {
 					row = contextItemSelectedStyle.Render(row)
 				} else {
 					row = contextItemStyle.Render(row)
 				}
 				lines = append(lines, row)
-				idx++
 			}
 		}
 	}

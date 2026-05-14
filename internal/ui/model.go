@@ -151,20 +151,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
-			// Cycle through visible panes. Context pane only counts if visible.
-			if m.contextPaneWidthEffective() > 0 {
-				m.focus = (m.focus + 1) % 3
-			} else {
-				m.focus = (m.focus + 1) % 2
-			}
+			m.focus = m.nextFocus(+1)
 			return m, nil
 		case "shift+tab":
-			// Cycle backwards through visible panes.
-			if m.contextPaneWidthEffective() > 0 {
-				m.focus = (m.focus - 1 + 3) % 3
-			} else {
-				m.focus = (m.focus - 1 + 2) % 2
-			}
+			m.focus = m.nextFocus(-1)
 			return m, nil
 		case "v":
 			m.toggleView()
@@ -183,6 +173,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.moveOverview(0, +1)
 				return m, m.scheduleContextRefresh()
 			}
+			if m.focus == paneContext {
+				m.contextMoveSelection(+1)
+				return m, nil
+			}
 			if m.focus == paneLeft {
 				return m, m.moveCursor(+1)
 			}
@@ -192,6 +186,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == viewOverview {
 				m.moveOverview(0, -1)
 				return m, m.scheduleContextRefresh()
+			}
+			if m.focus == paneContext {
+				m.contextMoveSelection(-1)
+				return m, nil
 			}
 			if m.focus == paneLeft {
 				return m, m.moveCursor(-1)
@@ -215,6 +213,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.fileCursor = m.overviewCursor
 				m.setView(viewChanges)
 				return m, m.scheduleContextRefresh()
+			}
+			if m.focus == paneContext {
+				return m, m.contextJumpToSelected()
 			}
 			return m, nil
 		case "g":
@@ -280,6 +281,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.contextHistoryExpanded = !m.contextHistoryExpanded
 			return m, m.scheduleContextRefresh()
+		case "esc":
+			if m.focus == paneContext {
+				m.focus = paneDiff
+				return m, nil
+			}
+			return m, nil
 		}
 
 	case editorDoneMsg:
@@ -762,6 +769,72 @@ func (m *Model) moveOverview(dx, dy int) {
 	if c != m.overviewCursor {
 		m.overviewCursor = c
 	}
+}
+
+// nextFocus returns the focus target after stepping `dir` (±1) through the
+// pane cycle, skipping panes that are currently hidden. Order: paneLeft →
+// paneDiff → paneContext → paneLeft.
+func (m Model) nextFocus(dir int) pane {
+	order := []pane{paneLeft, paneDiff}
+	if m.contextPaneWidthEffective() > 0 {
+		order = append(order, paneContext)
+	}
+	pos := 0
+	for i, p := range order {
+		if p == m.focus {
+			pos = i
+			break
+		}
+	}
+	pos = (pos + dir + len(order)) % len(order)
+	return order[pos]
+}
+
+// contextSelectableItems returns a flat list of (sectionIdx, itemIdx) pairs
+// for every Item whose Jump is non-nil — the only items the user can act on.
+func (m Model) contextSelectableItems() []struct{ S, I int } {
+	var out []struct{ S, I int }
+	for si, s := range m.contextPayload.Sections {
+		for ii, it := range s.Items {
+			if it.Jump != nil {
+				out = append(out, struct{ S, I int }{si, ii})
+			}
+		}
+	}
+	return out
+}
+
+func (m *Model) contextMoveSelection(delta int) {
+	n := len(m.contextSelectableItems())
+	if n == 0 {
+		return
+	}
+	m.contextSelected = (m.contextSelected + delta + n) % n
+}
+
+// contextJumpToSelected moves the diff cursor to the file the selected pane
+// item points at. Returns a Cmd that triggers a context refresh.
+func (m *Model) contextJumpToSelected() tea.Cmd {
+	items := m.contextSelectableItems()
+	if len(items) == 0 || m.contextSelected < 0 || m.contextSelected >= len(items) {
+		return nil
+	}
+	pos := items[m.contextSelected]
+	it := m.contextPayload.Sections[pos.S].Items[pos.I]
+	if it.Jump == nil {
+		return nil
+	}
+	files, _ := m.effectiveFiles()
+	for i, f := range files {
+		if f.Path == it.Jump.File {
+			m.fileCursor = i
+			m.refreshDiff()
+			break
+		}
+	}
+	// We don't scroll the viewport to it.Jump.Line — viewport line math is
+	// non-trivial. File-level jump is the v0 promise.
+	return m.scheduleContextRefresh()
 }
 
 // clampFocusToVisiblePanes ensures focus never points at the hidden context
