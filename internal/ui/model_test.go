@@ -161,3 +161,32 @@ func TestContextRefreshStaleCancel(t *testing.T) {
 		t.Error("stale msg cleared the payload")
 	}
 }
+
+func TestContextHistoryToggleWithH(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if m.contextHistoryExpanded {
+		t.Fatal("expected contextHistoryExpanded false initially")
+	}
+	// Task 9 wires Tab into paneContext; here we set focus directly so this
+	// test works against the build state at the end of Task 8.
+	m.focus = paneContext
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+	m = updated.(Model)
+	if !m.contextHistoryExpanded {
+		t.Error("after H: contextHistoryExpanded should be true")
+	}
+}
+
+func TestContextHistoryHIgnoredWithoutPaneFocus(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	// focus is paneLeft — H should be ignored.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+	m = updated.(Model)
+	if m.contextHistoryExpanded {
+		t.Error("H without pane focus should be a no-op")
+	}
+}

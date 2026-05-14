@@ -34,30 +34,31 @@ const (
 )
 
 type Model struct {
-	d                  *diff.Diff
-	commits            []diff.Commit
-	commitDiff         map[string]*diff.Diff
-	commitErr          map[string]error
-	repoRoot           string
-	view               viewMode
-	fileCursor         int
-	commitCursor       int
-	overviewCursor     int // index into the filtered Files list when in overview view
-	overviewCols       int // computed at render time so j/k can move by row
-	focus              pane
-	splitView          bool
-	contextPaneVisible bool // user-toggled; default true
-	contextPayload     ctxpane.Payload
-	contextCursor      ctxpane.Cursor
-	contextSelected    int   // currently highlighted item index when pane is focused
-	contextRefreshSeq  int   // monotonic; used to ignore stale debounced ticks
-	hunkOffsets        []int // viewport line indices of each hunk in the current file
-	width              int
-	height             int
-	forcedWidth        int
-	viewport           viewport.Model
-	ready              bool
-	statusMsg          string
+	d                      *diff.Diff
+	commits                []diff.Commit
+	commitDiff             map[string]*diff.Diff
+	commitErr              map[string]error
+	repoRoot               string
+	view                   viewMode
+	fileCursor             int
+	commitCursor           int
+	overviewCursor         int // index into the filtered Files list when in overview view
+	overviewCols           int // computed at render time so j/k can move by row
+	focus                  pane
+	splitView              bool
+	contextPaneVisible     bool // user-toggled; default true
+	contextPayload         ctxpane.Payload
+	contextCursor          ctxpane.Cursor
+	contextSelected        int   // currently highlighted item index when pane is focused
+	contextRefreshSeq      int   // monotonic; used to ignore stale debounced ticks
+	contextHistoryExpanded bool  // toggled by H when pane is focused
+	hunkOffsets            []int // viewport line indices of each hunk in the current file
+	width                  int
+	height                 int
+	forcedWidth            int
+	viewport               viewport.Model
+	ready                  bool
+	statusMsg              string
 
 	// filter state for the file list
 	filterInput     textinput.Model
@@ -273,6 +274,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "split view only available in Changes view"
 			}
 			return m, nil
+		case "H":
+			if m.focus != paneContext {
+				return m, nil
+			}
+			m.contextHistoryExpanded = !m.contextHistoryExpanded
+			return m, m.scheduleContextRefresh()
 		}
 
 	case editorDoneMsg:
@@ -288,10 +295,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // stale
 		}
 		cur := ctxpane.Cursor{
-			File:      m.currentFileForContext(),
-			HunkIndex: m.currentHunkIndex(),
-			Diff:      m.d,
-			RepoRoot:  m.repoRoot,
+			File:            m.currentFileForContext(),
+			HunkIndex:       m.currentHunkIndex(),
+			Diff:            m.d,
+			RepoRoot:        m.repoRoot,
+			HistoryExpanded: m.contextHistoryExpanded,
 		}
 		m.contextCursor = cur
 		seq := msg.Seq
@@ -845,10 +853,11 @@ func (m *Model) refreshDiff() {
 	}
 	if m.contextPaneVisible && m.contextPaneWidthEffective() > 0 {
 		cur := ctxpane.Cursor{
-			File:      m.currentFileForContext(),
-			HunkIndex: m.currentHunkIndex(),
-			Diff:      m.d,
-			RepoRoot:  m.repoRoot,
+			File:            m.currentFileForContext(),
+			HunkIndex:       m.currentHunkIndex(),
+			Diff:            m.d,
+			RepoRoot:        m.repoRoot,
+			HistoryExpanded: m.contextHistoryExpanded,
 		}
 		m.contextPayload = ctxpane.Resolve(context.Background(), cur)
 		m.contextCursor = cur

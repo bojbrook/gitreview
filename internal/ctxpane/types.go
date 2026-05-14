@@ -70,10 +70,11 @@ type Payload struct {
 // Cursor is the input to Resolve. It carries everything the resolver needs
 // to compute its sections without reaching into UI internals.
 type Cursor struct {
-	File      diff.File  // the currently-selected file (zero value if none)
-	HunkIndex int        // 0-based index into File.Hunks; -1 if none
-	Diff      *diff.Diff // the full diff (so cross-file sections can scan other files)
-	RepoRoot  string     // absolute path to the working-tree root
+	File            diff.File  // the currently-selected file (zero value if none)
+	HunkIndex       int        // 0-based index into File.Hunks; -1 if none
+	Diff            *diff.Diff // the full diff (so cross-file sections can scan other files)
+	RepoRoot        string     // absolute path to the working-tree root
+	HistoryExpanded bool       // true when user pressed H to expand history
 }
 
 // AnchorLine returns the OldNum (for removed lines) or NewNum (otherwise)

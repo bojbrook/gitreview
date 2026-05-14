@@ -24,6 +24,7 @@ func Resolve(ctx context.Context, cur Cursor) Payload {
 		func(c context.Context) Section { return buildSymbolSection(c, cur) },
 		func(c context.Context) Section { return buildCrossFileSection(c, cur) },
 		func(c context.Context) Section { return buildBlameSection(c, cur) },
+		func(c context.Context) Section { return buildHistorySection(c, cur) },
 	}
 	out := make([]Section, len(tasks))
 	var wg sync.WaitGroup
