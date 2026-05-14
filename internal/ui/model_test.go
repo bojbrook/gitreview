@@ -296,3 +296,65 @@ func TestRefreshDiffBuildsTree(t *testing.T) {
 		t.Errorf("row 0: got %+v want dir", m.treeRows[0])
 	}
 }
+
+func TestExpandCollapseEnter(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Row 0 is the "(root)" dir, currently expanded. Pressing Enter collapses it.
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !m.treeCollapsed[""] {
+		t.Error("after Enter on root dir: should be collapsed")
+	}
+	if len(m.treeRows) != 1 {
+		t.Errorf("after collapse: rows=%d want 1 (dir row only)", len(m.treeRows))
+	}
+
+	// Enter again: expand.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.treeCollapsed[""] {
+		t.Error("after second Enter: should be expanded")
+	}
+}
+
+func TestLExpandsThenDescends(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Start: dir row (root, expanded). l should descend to row 1.
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.rowCursor != 1 {
+		t.Errorf("l on expanded dir: cursor=%d want 1", m.rowCursor)
+	}
+
+	// Collapse via Enter, then l should expand (not descend).
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // collapse
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.treeCollapsed[""] {
+		t.Error("l on collapsed dir should expand it")
+	}
+}
+
+func TestHJumpsToParent(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Move cursor onto a file row.
+	m.rowCursor = 1
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = updated.(Model)
+	if m.rowCursor != 0 {
+		t.Errorf("h on file row: cursor=%d want 0 (parent dir)", m.rowCursor)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -207,10 +208,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.moveOverview(-1, 0)
 				return m, nil
 			}
+			if m.view == viewChanges && m.focus == paneLeft {
+				r := m.rowAtCursor()
+				if r.Kind == rowDir && !m.treeCollapsed[r.Path] {
+					m.toggleDirCollapsed(r.Path)
+					return m, nil
+				}
+				if r.Kind == rowFile {
+					parent := path.Dir(r.Path)
+					if parent == "." {
+						parent = ""
+					}
+					if row := indexOfDirRow(m.treeRows, parent); row >= 0 {
+						return m, m.setCursor(row)
+					}
+				}
+				return m, nil
+			}
 			return m, nil
 		case "l", "right":
 			if m.view == viewOverview {
 				m.moveOverview(+1, 0)
+				return m, nil
+			}
+			if m.view == viewChanges && m.focus == paneLeft {
+				r := m.rowAtCursor()
+				if r.Kind == rowDir {
+					if m.treeCollapsed[r.Path] {
+						m.toggleDirCollapsed(r.Path)
+					} else if m.rowCursor+1 < len(m.treeRows) && m.treeRows[m.rowCursor+1].Kind == rowFile {
+						return m, m.setCursor(m.rowCursor + 1)
+					}
+					return m, nil
+				}
 				return m, nil
 			}
 			return m, nil
@@ -227,10 +257,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.setView(viewChanges)
 				}
-				return m, m.scheduleContextRefresh()
+				return m, nil
 			}
 			if m.focus == paneContext {
 				return m, m.contextJumpToSelected()
+			}
+			if m.view == viewChanges && m.focus == paneLeft {
+				r := m.rowAtCursor()
+				if r.Kind == rowDir {
+					m.toggleDirCollapsed(r.Path)
+					return m, nil
+				}
 			}
 			return m, nil
 		case "g":
@@ -678,6 +715,48 @@ func (m Model) currentFileRow() (f diff.File, fileIdx int, ok bool) {
 		return diff.File{}, -1, false
 	}
 	return files[r.FileIdx], r.FileIdx, true
+}
+
+// toggleDirCollapsed flips a directory's expansion state and rebuilds the tree.
+// When collapsing, the cursor snaps to the dir row itself (so it doesn't end
+// up on a now-hidden child).
+func (m *Model) toggleDirCollapsed(dir string) {
+	wasCollapsed := m.treeCollapsed[dir]
+	if wasCollapsed {
+		delete(m.treeCollapsed, dir)
+	} else {
+		m.treeCollapsed[dir] = true
+	}
+	m.refreshDiff()
+	if !wasCollapsed {
+		// Just collapsed: snap cursor to the dir row.
+		if row := indexOfDirRow(m.treeRows, dir); row >= 0 {
+			m.rowCursor = row
+		} else {
+			m.rowCursor = clamp(m.rowCursor, 0, len(m.treeRows)-1)
+		}
+	}
+}
+
+// indexOfDirRow returns the row index of the dir row with the given path,
+// or -1 if not found.
+func indexOfDirRow(rows []treeRow, dir string) int {
+	for i, r := range rows {
+		if r.Kind == rowDir && r.Path == dir {
+			return i
+		}
+	}
+	return -1
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func (m *Model) setCursor(c int) tea.Cmd {
