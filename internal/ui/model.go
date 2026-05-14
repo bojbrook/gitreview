@@ -924,18 +924,6 @@ func (m *Model) refreshDiff() {
 		m.viewport.SetContent(renderFullDiff(d.Files, m.viewport.Width))
 		m.hunkOffsets = nil
 	}
-	if m.contextPaneVisible && m.contextPaneWidthEffective() > 0 {
-		cur := ctxpane.Cursor{
-			File:            m.currentFileForContext(),
-			HunkIndex:       m.currentHunkIndex(),
-			Diff:            m.d,
-			RepoRoot:        m.repoRoot,
-			HistoryExpanded: m.contextHistoryExpanded,
-		}
-		m.contextPayload = ctxpane.Resolve(context.Background(), cur)
-		m.contextCursor = cur
-		m.contextSelected = 0
-	}
 	m.viewport.GotoTop()
 }
 

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -93,6 +94,17 @@ func TestContextPaneVisibleByDefault(t *testing.T) {
 	if m.contextPaneWidthEffective() == 0 {
 		t.Error("contextPaneWidthEffective: got 0 at width=140")
 	}
+	// Context pane populates via the async path. Drive it by delivering a
+	// contextRefreshMsg (which returns a Cmd), then calling that Cmd to get the
+	// contextResultMsg, then delivering that.
+	updated, cmd := m.Update(contextRefreshMsg{Seq: m.contextRefreshSeq})
+	m = updated.(Model)
+	if cmd != nil {
+		if resultMsg := cmd(); resultMsg != nil {
+			updated, _ = m.Update(resultMsg)
+			m = updated.(Model)
+		}
+	}
 	if !strings.Contains(m.View(), "Where") {
 		t.Errorf("View missing context section. Got:\n%s", m.View())
 	}
@@ -144,21 +156,24 @@ func TestContextRefreshStaleCancel(t *testing.T) {
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 
+	// Prime a known payload so we can detect overwrites.
+	m.contextPayload = ctxpane.Payload{
+		Sections: []ctxpane.Section{{Kind: ctxpane.SectionWhere, Status: ctxpane.StatusOK, Items: []ctxpane.Item{{Text: "sentinel"}}}},
+	}
+
 	// Schedule two refreshes back to back; the first should be stale.
 	_ = m.scheduleContextRefresh()
 	staleSeq := m.contextRefreshSeq
 	_ = m.scheduleContextRefresh()
 
-	// Snapshot the payload before delivering the stale msg.
-	want := m.contextPayload
+	// Delivering the stale msg must not crash and must not replace the payload.
 	updated, _ = m.Update(contextRefreshMsg{Seq: staleSeq})
 	m = updated.(Model)
-	// Stale msg must not crash and must not replace the payload.
 	if m.contextRefreshSeq != staleSeq+1 {
 		t.Errorf("contextRefreshSeq: got %d want %d", m.contextRefreshSeq, staleSeq+1)
 	}
-	if &m.contextPayload.Sections == nil && want.Sections != nil {
-		t.Error("stale msg cleared the payload")
+	if len(m.contextPayload.Sections) == 0 || m.contextPayload.Sections[0].Items[0].Text != "sentinel" {
+		t.Errorf("stale msg overwrote payload; sections=%+v", m.contextPayload.Sections)
 	}
 }
 
