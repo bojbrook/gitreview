@@ -21,6 +21,7 @@ const PerSectionTimeout = 300 * time.Millisecond
 func Resolve(ctx context.Context, cur Cursor) Payload {
 	tasks := []func(context.Context) Section{
 		func(c context.Context) Section { return buildWhereSection(cur) },
+		func(c context.Context) Section { return buildSymbolSection(c, cur) },
 		func(c context.Context) Section { return buildBlameSection(c, cur) },
 	}
 	out := make([]Section, len(tasks))
@@ -66,9 +67,9 @@ func kindFor(i int) SectionKind {
 	case 0:
 		return SectionWhere
 	case 1:
-		return SectionBlame
-	case 2:
 		return SectionSymbol
+	case 2:
+		return SectionBlame
 	case 3:
 		return SectionCrossFile
 	case 4:
