@@ -85,6 +85,18 @@ type Model struct {
 	// PR comment state — non-empty only in PR mode.
 	reviewComments []ctxpane.CommentRef // fetched, mapped from pr.ReviewComment
 	drafts         []ctxpane.Draft      // in-memory; cleared on submit
+
+	// Thread modal state.
+	modalOpen     bool
+	modalEntries  []threadEntry
+	modalSelected int
+	modalAnchor   modalAnchor
+}
+
+type modalAnchor struct {
+	Path string
+	Line int
+	Side string
 }
 
 // ForceWidth overrides the terminal width bubbletea reports. Useful when
@@ -173,6 +185,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// While the filter input is focused, every key goes to it (except a few escapes).
 		if m.filtering {
 			return m.handleFilterKey(msg)
+		}
+		// Modal traps all keys when open.
+		if m.modalOpen {
+			switch msg.String() {
+			case "esc":
+				m.modalOpen = false
+				return m, nil
+			case "j", "down":
+				if m.modalSelected+1 < len(m.modalEntries) {
+					m.modalSelected++
+				}
+				return m, nil
+			case "k", "up":
+				if m.modalSelected > 0 {
+					m.modalSelected--
+				}
+				return m, nil
+			case "x":
+				if m.modalSelected >= 0 && m.modalSelected < len(m.modalEntries) {
+					e := m.modalEntries[m.modalSelected]
+					if e.IsDraft && e.DraftIdx >= 0 && e.DraftIdx < len(m.drafts) {
+						m.drafts = append(m.drafts[:e.DraftIdx], m.drafts[e.DraftIdx+1:]...)
+						m.modalEntries = buildThread(m.reviewComments, m.drafts, m.modalAnchor.Path, m.modalAnchor.Line, m.modalAnchor.Side)
+						if m.modalSelected >= len(m.modalEntries) {
+							m.modalSelected = maxInt(0, len(m.modalEntries)-1)
+						}
+						if len(m.modalEntries) == 0 {
+							m.modalOpen = false
+						}
+						return m, m.scheduleContextRefresh()
+					}
+				}
+				return m, nil
+			case "e":
+				if m.modalSelected >= 0 && m.modalSelected < len(m.modalEntries) {
+					e := m.modalEntries[m.modalSelected]
+					if e.IsDraft {
+						return m, m.editDraft(e.DraftIdx)
+					}
+				}
+				return m, nil
+			}
+			// Any other key while modal is open: swallow.
+			return m, nil
 		}
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -369,6 +425,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				side = "LEFT"
 			}
 			return m, m.composeDraft(fr.Path, line, side)
+		case "t":
+			if m.prMeta == nil || m.view != viewChanges {
+				return m, nil
+			}
+			fr, _, ok := m.currentFileRow()
+			if !ok {
+				return m, nil
+			}
+			cur := ctxpane.Cursor{File: fr, HunkIndex: m.currentHunkIndex()}
+			line, kind, ok := cur.AnchorLine()
+			if !ok || line == 0 {
+				return m, nil
+			}
+			side := "RIGHT"
+			if kind == diff.LineRemoved {
+				side = "LEFT"
+			}
+			entries := buildThread(m.reviewComments, m.drafts, fr.Path, line, side)
+			if len(entries) == 0 {
+				return m, nil
+			}
+			m.modalOpen = true
+			m.modalEntries = entries
+			m.modalSelected = 0
+			m.modalAnchor = modalAnchor{Path: fr.Path, Line: line, Side: side}
+			return m, nil
 		case "s":
 			if m.view == viewChanges {
 				m.splitView = !m.splitView
@@ -412,6 +494,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.drafts = append(m.drafts, msg.draft)
 		m.statusMsg = fmt.Sprintf("draft saved (%d total)", len(m.drafts))
+		return m, m.scheduleContextRefresh()
+
+	case draftEditedMsg:
+		if msg.err != nil {
+			m.statusMsg = "edit: " + msg.err.Error()
+			return m, nil
+		}
+		if msg.idx < 0 || msg.idx >= len(m.drafts) {
+			return m, nil
+		}
+		if msg.body == "" {
+			m.drafts = append(m.drafts[:msg.idx], m.drafts[msg.idx+1:]...)
+		} else {
+			m.drafts[msg.idx].Body = msg.body
+		}
+		if m.modalOpen {
+			m.modalEntries = buildThread(m.reviewComments, m.drafts, m.modalAnchor.Path, m.modalAnchor.Line, m.modalAnchor.Side)
+			if m.modalSelected >= len(m.modalEntries) {
+				m.modalSelected = maxInt(0, len(m.modalEntries)-1)
+			}
+			if len(m.modalEntries) == 0 {
+				m.modalOpen = false
+			}
+		}
 		return m, m.scheduleContextRefresh()
 
 	case contextRefreshMsg:
@@ -515,6 +621,63 @@ type draftComposedMsg struct {
 	err   error
 }
 
+// editDraft re-spawns $EDITOR with the existing draft body. Empty save = delete.
+func (m *Model) editDraft(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(m.drafts) {
+		return nil
+	}
+	d := m.drafts[idx]
+	f, err := os.CreateTemp("", "gitreview-draft-*.md")
+	if err != nil {
+		m.statusMsg = "edit: " + err.Error()
+		return nil
+	}
+	if _, err := f.WriteString(d.Body); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		m.statusMsg = "edit: " + err.Error()
+		return nil
+	}
+	f.Close()
+	cmd := editorCmd(f.Name(), 1)
+	if cmd == nil {
+		m.statusMsg = "edit: no editor found (set $EDITOR)"
+		os.Remove(f.Name())
+		return nil
+	}
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		defer os.Remove(f.Name())
+		if err != nil {
+			return draftEditedMsg{idx: idx, err: err}
+		}
+		raw, readErr := os.ReadFile(f.Name())
+		if readErr != nil {
+			return draftEditedMsg{idx: idx, err: readErr}
+		}
+		return draftEditedMsg{idx: idx, body: stripDraftComments(string(raw))}
+	})
+}
+
+type draftEditedMsg struct {
+	idx  int
+	body string
+	err  error
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (m *Model) openInEditor() tea.Cmd {
 	f, line, ok := m.selectedEditTarget()
 	if !ok {
@@ -594,7 +757,17 @@ func (m Model) View() string {
 		}
 		body = lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderHelp())
+	view := lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderHelp())
+	if m.modalOpen {
+		modalW := minInt(m.width-4, 80)
+		innerW := modalW - 6
+		title := fmt.Sprintf("Thread: %s:%d", m.modalAnchor.Path, m.modalAnchor.Line)
+		content := renderThreadModal(title, m.modalEntries, m.modalSelected, innerW)
+		modal := modalStyle.Width(modalW).Render(content)
+		view = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+			lipgloss.WithWhitespaceChars(" "))
+	}
+	return view
 }
 
 // renderTopHeader is a single-line strip showing the three view tabs and PR

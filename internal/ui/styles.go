@@ -100,4 +100,16 @@ var (
 	prHeaderStyle = lipgloss.NewStyle().
 			Foreground(colBorderFocus).
 			Bold(true)
+
+	// modalStyle is the outer box for popup overlays (thread modal etc.).
+	modalStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colBorderFocus).
+			Padding(1, 2)
+
+	// prDraftStyle marks user-authored drafts so they're distinguishable
+	// from fetched comments.
+	prDraftStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Bold(true)
 )
