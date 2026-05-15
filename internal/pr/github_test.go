@@ -55,6 +55,49 @@ func startMockGitHub(t *testing.T) (*httptest.Server, string) {
 		})
 	})
 
+	mux.HandleFunc("/api/v3/repos/foo/bar/pulls/89/comments", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"id":   1001,
+				"user": map[string]any{"login": "alice"},
+				"path": "src/a.go",
+				"line": 12,
+				"side": "RIGHT",
+				"body": "can we add a context timeout?",
+			},
+			{
+				"id":             1002,
+				"user":           map[string]any{"login": "bob"},
+				"path":           "src/a.go",
+				"line":           12,
+				"side":           "RIGHT",
+				"body":           "yeah +1",
+				"in_reply_to_id": 1001,
+			},
+		})
+	})
+
+	mux.HandleFunc("/api/v3/repos/foo/bar/issues/89/comments", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"id":   2001,
+				"user": map[string]any{"login": "carol"},
+				"body": "Looks good overall, one nit below.",
+			},
+		})
+	})
+
+	mux.HandleFunc("/api/v3/repos/foo/bar/pulls/89/reviews", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"id":    3001,
+				"user":  map[string]any{"login": "carol"},
+				"body":  "LGTM",
+				"state": "APPROVED",
+			},
+		})
+	})
+
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, srv.URL + "/"
