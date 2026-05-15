@@ -548,18 +548,42 @@ const (
 // --- filter ---
 
 func (m *Model) startFiltering() tea.Cmd {
+	if !m.filtering {
+		// Snapshot the file under the cursor (path is stable across rebuilds;
+		// the row index is not). Snapshot collapsed state so dirs come back on
+		// clear-filter.
+		if f, _, ok := m.currentFileRow(); ok {
+			m.pathPreFilter = f.Path
+		} else {
+			m.pathPreFilter = ""
+		}
+		m.preFilterCollapsed = copyStringBoolMap(m.treeCollapsed)
+	}
 	m.filtering = true
 	m.filterInput.SetValue(m.filter)
 	m.filterInput.CursorEnd()
 	return m.filterInput.Focus()
 }
 
+func copyStringBoolMap(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func (m *Model) commitFilter() {
 	m.filter = strings.TrimSpace(m.filterInput.Value())
 	m.filtering = false
 	m.filterInput.Blur()
-	m.rowCursor = 0
 	m.refreshDiff()
+	// Land on the first file row after the rebuild.
+	if row := FirstFileRow(m.treeRows); row >= 0 {
+		m.rowCursor = row
+	} else {
+		m.rowCursor = 0
+	}
 }
 
 func (m *Model) cancelFilter() {
@@ -571,8 +595,27 @@ func (m *Model) cancelFilter() {
 func (m *Model) clearFilter() {
 	m.filter = ""
 	m.filterInput.SetValue("")
-	m.rowCursor = 0
+	// Restore pre-filter expansion state, then rebuild.
+	if m.preFilterCollapsed != nil {
+		m.treeCollapsed = m.preFilterCollapsed
+		m.preFilterCollapsed = nil
+	}
 	m.refreshDiff()
+	// Try to restore the cursor to the same file path. If that file is no
+	// longer visible, land on the first file row (or row 0 as a last resort).
+	if m.pathPreFilter != "" {
+		if row := RowOfFile(m.treeRows, m.pathPreFilter); row >= 0 {
+			m.rowCursor = row
+			m.pathPreFilter = ""
+			return
+		}
+	}
+	if row := FirstFileRow(m.treeRows); row >= 0 {
+		m.rowCursor = row
+	} else {
+		m.rowCursor = 0
+	}
+	m.pathPreFilter = ""
 }
 
 func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -586,10 +629,14 @@ func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.filterInput, cmd = m.filterInput.Update(msg)
-	// Live update: re-filter and refresh the diff for the first matching file.
+	// Live update: re-filter, rebuild, and land on the first matching file.
 	m.filter = strings.TrimSpace(m.filterInput.Value())
-	m.rowCursor = 0
 	m.refreshDiff()
+	if row := FirstFileRow(m.treeRows); row >= 0 {
+		m.rowCursor = row
+	} else {
+		m.rowCursor = 0
+	}
 	return m, cmd
 }
 

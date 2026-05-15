@@ -402,3 +402,59 @@ func TestNextUnreviewedWalksFileRowsOnly(t *testing.T) {
 		t.Errorf("M: cursor=%d want 2 (next file)", m.rowCursor)
 	}
 }
+
+func TestFilterPreservesCollapsedAfterClear(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Collapse the (root) dir, then start filtering, then cancel — collapsed should persist.
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // collapse root
+	m = updated.(Model)
+	if !m.treeCollapsed[""] {
+		t.Fatal("setup: root should be collapsed")
+	}
+
+	// Start filter; collapsed state is snapshotted but tree is rebuilt with filter
+	// (which force-expands), so visible rows include children. The collapsed
+	// MAP itself should still report "" as collapsed.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // cancel filter
+	m = updated.(Model)
+
+	if !m.treeCollapsed[""] {
+		t.Error("after cancel filter: root should still be collapsed")
+	}
+}
+
+func TestFilterPathPreFilterRestores(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Start with cursor on first file (main.go).
+	m.rowCursor = 1
+	if f, _, ok := m.currentFileRow(); !ok || f.Path != "main.go" {
+		t.Fatalf("setup: cursor should be on main.go, got ok=%v f=%+v", ok, f)
+	}
+
+	// Filter "added" → only added.go matches.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, ch := range "added" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+
+	// Clear filter via direct call (the `c` key path is also tested elsewhere).
+	m.clearFilter()
+	if f, _, ok := m.currentFileRow(); !ok || f.Path != "main.go" {
+		t.Errorf("after clear: cursor should restore to main.go, got ok=%v f=%+v", ok, f)
+	}
+}
