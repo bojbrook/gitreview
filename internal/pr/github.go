@@ -136,21 +136,6 @@ func toCommits(commits []*github.RepositoryCommit) []diff.Commit {
 	return out
 }
 
-// PRMeta carries the human-readable PR header data the TUI displays.
-// Defined here temporarily; Task 6 moves it to bundle.go.
-type PRMeta struct {
-	Number  int
-	Owner   string
-	Repo    string
-	Title   string
-	Body    string
-	Author  string
-	State   string
-	HeadSHA string
-	BaseSHA string
-	HTMLURL string
-}
-
 func toMeta(pr *github.PullRequest, owner, repo string) PRMeta {
 	state := pr.GetState()
 	if pr.GetMerged() {
