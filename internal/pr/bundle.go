@@ -26,10 +26,13 @@ type PRMeta struct {
 // the local-diff path; Meta drives the PR-mode header; WorktreePath becomes
 // the UI's repoRoot.
 type Bundle struct {
-	Diff         *diff.Diff
-	Commits      []diff.Commit
-	Meta         PRMeta
-	WorktreePath string
+	Diff           *diff.Diff
+	Commits        []diff.Commit
+	Meta           PRMeta
+	WorktreePath   string
+	ReviewComments []ReviewComment
+	IssueComments  []IssueComment
+	Reviews        []Review
 }
 
 // Load orchestrates the full PR-loading flow. repoRootFunc is a seam for
@@ -106,14 +109,32 @@ func Load(ctx context.Context, refStr string, repoRootFunc func() (string, error
 		return nil, err
 	}
 
+	// Non-fatal fetches: failures leave the slice empty and the affected
+	// display section renders (error). The PR still opens.
+	reviewComments, err := fetchReviewComments(ctx, client, ref.Owner, ref.Repo, ref.Number)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gitreview: warn: list review comments:", err)
+	}
+	issueComments, err := fetchIssueComments(ctx, client, ref.Owner, ref.Repo, ref.Number)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gitreview: warn: list issue comments:", err)
+	}
+	reviews, err := fetchReviews(ctx, client, ref.Owner, ref.Repo, ref.Number)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gitreview: warn: list reviews:", err)
+	}
+
 	d, err := toDiff(files, ref.Owner, ref.Repo, ref.Number)
 	if err != nil {
 		return nil, err
 	}
 	return &Bundle{
-		Diff:         d,
-		Commits:      toCommits(commits),
-		Meta:         toMeta(pr, ref.Owner, ref.Repo),
-		WorktreePath: wtPath,
+		Diff:           d,
+		Commits:        toCommits(commits),
+		Meta:           toMeta(pr, ref.Owner, ref.Repo),
+		WorktreePath:   wtPath,
+		ReviewComments: reviewComments,
+		IssueComments:  issueComments,
+		Reviews:        reviews,
 	}, nil
 }
