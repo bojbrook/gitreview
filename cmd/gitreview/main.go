@@ -124,12 +124,28 @@ func runPRMode(args []string) {
 		fmt.Fprintln(os.Stderr, "gitreview: warn: submit disabled (auth):", tokenErr)
 	}
 	var submitter func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	var refetcher func(ctx context.Context) (*ui.RefetcherResult, error)
 	if submitToken != "" {
-		s, sErr := pr.NewSubmitter(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number)
-		if sErr != nil {
+		if s, sErr := pr.NewSubmitter(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number); sErr != nil {
 			fmt.Fprintln(os.Stderr, "gitreview: warn: submit disabled (client):", sErr)
 		} else {
 			submitter = s
+		}
+		if rf, rErr := pr.NewRefetcher(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number); rErr != nil {
+			fmt.Fprintln(os.Stderr, "gitreview: warn: refetch disabled:", rErr)
+		} else {
+			refetcher = func(ctx context.Context) (*ui.RefetcherResult, error) {
+				rc, err := rf(ctx)
+				if err != nil || rc == nil {
+					return nil, err
+				}
+				out := &ui.RefetcherResult{
+					ReviewComments: mapCommentRefs(rc.ReviewComments),
+					IssueComments:  mapIssueComments(rc.IssueComments),
+					Reviews:        mapReviews(rc.Reviews),
+				}
+				return out, nil
+			}
 		}
 	}
 	m := ui.New(bundle.Diff, bundle.Commits, bundle.WorktreePath, &ui.PRBundle{
@@ -138,6 +154,7 @@ func runPRMode(args []string) {
 		IssueComments:  ics,
 		Reviews:        rvs,
 		Submitter:      submitter,
+		Refetcher:      refetcher,
 	})
 	if *width > 0 {
 		m.ForceWidth(*width)
@@ -188,4 +205,46 @@ func humanRelative(t time.Time) string {
 		return fmt.Sprintf("%dd ago", int(d/(24*time.Hour)))
 	}
 	return t.Format("2006-01-02")
+}
+
+// mapCommentRefs maps the wire-domain pr.ReviewComment slice into the
+// UI-domain ctxpane.CommentRef slice. Pre-formats the relative time.
+func mapCommentRefs(in []pr.ReviewComment) []ctxpane.CommentRef {
+	out := make([]ctxpane.CommentRef, 0, len(in))
+	for _, c := range in {
+		out = append(out, ctxpane.CommentRef{
+			User: c.User,
+			Path: c.Path,
+			Line: c.Line,
+			Side: c.Side,
+			Body: c.Body,
+			Age:  humanRelative(c.CreatedAt),
+		})
+	}
+	return out
+}
+
+func mapIssueComments(in []pr.IssueComment) []ctxpane.IssueCommentDisplay {
+	out := make([]ctxpane.IssueCommentDisplay, 0, len(in))
+	for _, c := range in {
+		out = append(out, ctxpane.IssueCommentDisplay{
+			User: c.User,
+			Age:  humanRelative(c.CreatedAt),
+			Body: c.Body,
+		})
+	}
+	return out
+}
+
+func mapReviews(in []pr.Review) []ctxpane.ReviewDisplay {
+	out := make([]ctxpane.ReviewDisplay, 0, len(in))
+	for _, r := range in {
+		out = append(out, ctxpane.ReviewDisplay{
+			User:  r.User,
+			State: r.State,
+			Age:   humanRelative(r.SubmittedAt),
+			Body:  r.Body,
+		})
+	}
+	return out
 }

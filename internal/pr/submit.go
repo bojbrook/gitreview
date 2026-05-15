@@ -64,3 +64,34 @@ func NewSubmitter(token, owner, repo string, num int) (func(ctx context.Context,
 		return Submit(ctx, c, owner, repo, num, body, drafts)
 	}, nil
 }
+
+// RefetchedComments bundles the three comment streams pulled by a refetch.
+type RefetchedComments struct {
+	ReviewComments []ReviewComment
+	IssueComments  []IssueComment
+	Reviews        []Review
+}
+
+// NewRefetcher returns a closure that re-pulls the PR's three comment streams.
+// Errors on any stream are non-fatal: the other streams still populate and
+// the failing stream returns an empty slice. The returned error is non-nil
+// only if all three streams fail.
+func NewRefetcher(token, owner, repo string, num int) (func(ctx context.Context) (*RefetchedComments, error), error) {
+	c, err := newClient(token, "")
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context) (*RefetchedComments, error) {
+		out := &RefetchedComments{}
+		rcs, rcErr := fetchReviewComments(ctx, c, owner, repo, num)
+		ics, icErr := fetchIssueComments(ctx, c, owner, repo, num)
+		rvs, rvErr := fetchReviews(ctx, c, owner, repo, num)
+		out.ReviewComments = rcs
+		out.IssueComments = ics
+		out.Reviews = rvs
+		if rcErr != nil && icErr != nil && rvErr != nil {
+			return out, fmt.Errorf("all comment fetches failed: %v / %v / %v", rcErr, icErr, rvErr)
+		}
+		return out, nil
+	}, nil
+}

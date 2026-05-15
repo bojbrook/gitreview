@@ -90,6 +90,7 @@ type Model struct {
 	reviews        []ctxpane.ReviewDisplay
 	reviewBody     string // composed via B; consumed by S
 	submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	refetcher      func(ctx context.Context) (*RefetcherResult, error)
 
 	// Thread modal state.
 	modalOpen     bool
@@ -117,6 +118,17 @@ type PRBundle struct {
 	IssueComments  []ctxpane.IssueCommentDisplay
 	Reviews        []ctxpane.ReviewDisplay
 	Submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	// Refetcher re-pulls the three comment streams from GitHub. Called after
+	// successful submit so just-posted comments appear without re-launch.
+	Refetcher func(ctx context.Context) (*RefetcherResult, error)
+}
+
+// RefetcherResult is what the Refetcher closure returns: the three comment
+// streams already mapped into UI-domain display types.
+type RefetcherResult struct {
+	ReviewComments []ctxpane.CommentRef
+	IssueComments  []ctxpane.IssueCommentDisplay
+	Reviews        []ctxpane.ReviewDisplay
 }
 
 func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Model {
@@ -142,6 +154,7 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Mod
 		m.issueComments = pb.IssueComments
 		m.reviews = pb.Reviews
 		m.submitter = pb.Submitter
+		m.refetcher = pb.Refetcher
 	}
 	return m
 }
@@ -561,6 +574,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.drafts = nil
 		m.reviewBody = ""
 		m.statusMsg = fmt.Sprintf("submitted %d %s", msg.n, plural("comment", msg.n))
+		if m.refetcher != nil {
+			return m, m.runRefetch()
+		}
+		return m, m.scheduleContextRefresh()
+
+	case refetchDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = "refetch: " + msg.err.Error()
+			return m, m.scheduleContextRefresh()
+		}
+		if msg.res != nil {
+			m.reviewComments = msg.res.ReviewComments
+			m.issueComments = msg.res.IssueComments
+			m.reviews = msg.res.Reviews
+		}
 		return m, m.scheduleContextRefresh()
 
 	case draftEditedMsg:
@@ -647,6 +675,17 @@ func (m *Model) composeDraft(path string, line int, side string) tea.Cmd {
 		m.statusMsg = "compose: " + err.Error()
 		return nil
 	}
+	// Pre-populate with a context header so the editor isn't a blank slate.
+	// All lines are #-prefixed and stripped by stripDraftComments on save.
+	if fr, _, ok := m.currentFileRow(); ok {
+		header := commentContextHeader(fr, line, side)
+		if _, err := f.WriteString(header); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			m.statusMsg = "compose: " + err.Error()
+			return nil
+		}
+	}
 	f.Close()
 	cmd := editorCmd(f.Name(), 1)
 	if cmd == nil {
@@ -668,6 +707,75 @@ func (m *Model) composeDraft(path string, line int, side string) tea.Cmd {
 			draft: ctxpane.Draft{Path: path, Line: line, Side: side, Body: body},
 		}
 	})
+}
+
+// commentContextHeader returns a #-prefixed header showing the file, line,
+// side, and ~6 surrounding diff lines (cursor line marked with >). All lines
+// start with "#" so stripDraftComments removes them on save.
+func commentContextHeader(f diff.File, line int, side string) string {
+	type entry struct {
+		prefix   string // " " "+" "-"
+		num      int
+		text     string
+		isAnchor bool
+	}
+	var entries []entry
+	for _, h := range f.Hunks {
+		for _, l := range h.Lines {
+			prefix := " "
+			num := l.NewNum
+			switch l.Kind {
+			case diff.LineAdded:
+				prefix = "+"
+			case diff.LineRemoved:
+				prefix = "-"
+				num = l.OldNum
+			}
+			isAnchor := false
+			if side == "RIGHT" && l.Kind != diff.LineRemoved && l.NewNum == line {
+				isAnchor = true
+			} else if side == "LEFT" && l.Kind != diff.LineAdded && l.OldNum == line {
+				isAnchor = true
+			}
+			entries = append(entries, entry{prefix, num, l.Content, isAnchor})
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Commenting on %s:%d (%s side)\n#\n", f.Path, line, side)
+
+	anchorIdx := -1
+	for i, e := range entries {
+		if e.isAnchor {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx >= 0 {
+		fmt.Fprintln(&b, "# Context (cursor line marked >):")
+		fmt.Fprintln(&b, "#")
+		start := anchorIdx - 3
+		if start < 0 {
+			start = 0
+		}
+		end := anchorIdx + 4
+		if end > len(entries) {
+			end = len(entries)
+		}
+		for i := start; i < end; i++ {
+			e := entries[i]
+			marker := " "
+			if i == anchorIdx {
+				marker = ">"
+			}
+			fmt.Fprintf(&b, "# %s  %s %4d  %s\n", marker, e.prefix, e.num, e.text)
+		}
+		fmt.Fprintln(&b, "#")
+	}
+
+	fmt.Fprintln(&b, "# Write your comment below. Lines starting with # are stripped.")
+	fmt.Fprintln(&b)
+	return b.String()
 }
 
 // stripDraftComments removes lines starting with # and trims surrounding space.
@@ -699,7 +807,16 @@ func (m *Model) editDraft(idx int) tea.Cmd {
 		m.statusMsg = "edit: " + err.Error()
 		return nil
 	}
-	if _, err := f.WriteString(d.Body); err != nil {
+	// Re-prepend context header so the user still sees what they're editing.
+	var initial string
+	for _, file := range m.d.Files {
+		if file.Path == d.Path {
+			initial = commentContextHeader(file, d.Line, d.Side)
+			break
+		}
+	}
+	initial += d.Body
+	if _, err := f.WriteString(initial); err != nil {
 		f.Close()
 		os.Remove(f.Name())
 		m.statusMsg = "edit: " + err.Error()
@@ -833,6 +950,21 @@ func truncForTemplate(s string, n int) string {
 
 type submitDoneMsg struct {
 	n   int
+	err error
+}
+
+// runRefetch kicks off the configured refetcher in a Cmd; result delivers
+// as refetchDoneMsg.
+func (m *Model) runRefetch() tea.Cmd {
+	refetch := m.refetcher
+	return func() tea.Msg {
+		res, err := refetch(context.Background())
+		return refetchDoneMsg{res: res, err: err}
+	}
+}
+
+type refetchDoneMsg struct {
+	res *RefetcherResult
 	err error
 }
 
