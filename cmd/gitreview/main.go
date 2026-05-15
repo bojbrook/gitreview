@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	"github.com/bowenbrooks/gitreview/internal/pr"
 	"github.com/bowenbrooks/gitreview/internal/ui"
@@ -53,7 +55,7 @@ func runPreflightMode() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gitreview: warn: could not resolve repo root:", err)
 	}
-	m := ui.New(d, commits, repoRoot, nil)
+	m := ui.New(d, commits, repoRoot, (*ui.PRBundle)(nil))
 	if *width > 0 {
 		m.ForceWidth(*width)
 	}
@@ -89,7 +91,21 @@ func runPRMode(args []string) {
 		}
 	}()
 
-	m := ui.New(bundle.Diff, bundle.Commits, bundle.WorktreePath, &bundle.Meta)
+	refs := make([]ctxpane.CommentRef, 0, len(bundle.ReviewComments))
+	for _, c := range bundle.ReviewComments {
+		refs = append(refs, ctxpane.CommentRef{
+			User: c.User,
+			Path: c.Path,
+			Line: c.Line,
+			Side: c.Side,
+			Body: c.Body,
+			Age:  humanRelative(c.CreatedAt),
+		})
+	}
+	m := ui.New(bundle.Diff, bundle.Commits, bundle.WorktreePath, &ui.PRBundle{
+		Meta:           &bundle.Meta,
+		ReviewComments: refs,
+	})
 	if *width > 0 {
 		m.ForceWidth(*width)
 	}
@@ -120,4 +136,23 @@ func resolveMode(working, staged, committed bool) (diff.Mode, error) {
 	default:
 		return diff.ModeAll, nil
 	}
+}
+
+// humanRelative formats a time as a short relative string like "2h ago".
+func humanRelative(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d/time.Minute))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d/time.Hour))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d/(24*time.Hour)))
+	}
+	return t.Format("2006-01-02")
 }

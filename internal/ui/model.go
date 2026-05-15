@@ -81,6 +81,10 @@ type Model struct {
 	reviewedFiles map[string]bool
 
 	prMeta *pr.PRMeta // non-nil when running in PR mode
+
+	// PR comment state — non-empty only in PR mode.
+	reviewComments []ctxpane.CommentRef // fetched, mapped from pr.ReviewComment
+	drafts         []ctxpane.Draft      // in-memory; cleared on submit
 }
 
 // ForceWidth overrides the terminal width bubbletea reports. Useful when
@@ -89,12 +93,18 @@ func (m *Model) ForceWidth(w int) {
 	m.forcedWidth = w
 }
 
-func New(d *diff.Diff, commits []diff.Commit, repoRoot string, prMeta *pr.PRMeta) Model {
+// PRBundle is the optional PR data ui.New accepts. nil in pre-flight mode.
+type PRBundle struct {
+	Meta           *pr.PRMeta
+	ReviewComments []ctxpane.CommentRef
+}
+
+func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Model {
 	ti := textinput.New()
 	ti.Prompt = "/"
 	ti.Placeholder = "filter files…"
 	ti.CharLimit = 100
-	return Model{
+	m := Model{
 		d:                  d,
 		commits:            commits,
 		commitDiff:         map[string]*diff.Diff{},
@@ -105,8 +115,12 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string, prMeta *pr.PRMeta
 		reviewedFiles:      map[string]bool{},
 		contextPaneVisible: true,
 		treeCollapsed:      map[string]bool{},
-		prMeta:             prMeta,
 	}
+	if pb != nil {
+		m.prMeta = pb.Meta
+		m.reviewComments = pb.ReviewComments
+	}
+	return m
 }
 
 // editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
@@ -331,6 +345,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "browser: " + err.Error()
 			}
 			return m, nil
+		case "C":
+			if m.prMeta == nil {
+				return m, nil
+			}
+			if m.view != viewChanges {
+				m.statusMsg = "C: switch to changes view first"
+				return m, nil
+			}
+			fr, _, ok := m.currentFileRow()
+			if !ok {
+				m.statusMsg = "C: place cursor on a diff line first"
+				return m, nil
+			}
+			cur := ctxpane.Cursor{File: fr, HunkIndex: m.currentHunkIndex()}
+			line, kind, ok := cur.AnchorLine()
+			if !ok || line == 0 {
+				m.statusMsg = "C: no anchor line in this hunk"
+				return m, nil
+			}
+			side := "RIGHT"
+			if kind == diff.LineRemoved {
+				side = "LEFT"
+			}
+			return m, m.composeDraft(fr.Path, line, side)
 		case "s":
 			if m.view == viewChanges {
 				m.splitView = !m.splitView
@@ -363,6 +401,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case draftComposedMsg:
+		if msg.err != nil {
+			m.statusMsg = "compose: " + msg.err.Error()
+			return m, nil
+		}
+		if msg.draft.Body == "" {
+			m.statusMsg = "compose: cancelled (empty)"
+			return m, nil
+		}
+		m.drafts = append(m.drafts, msg.draft)
+		m.statusMsg = fmt.Sprintf("draft saved (%d total)", len(m.drafts))
+		return m, m.scheduleContextRefresh()
+
 	case contextRefreshMsg:
 		if msg.Seq != m.contextRefreshSeq {
 			return m, nil // stale
@@ -373,6 +424,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Diff:            m.d,
 			RepoRoot:        m.repoRoot,
 			HistoryExpanded: m.contextHistoryExpanded,
+			ReviewComments:  m.reviewComments,
+			Drafts:          m.drafts,
 		}
 		m.contextCursor = cur
 		seq := msg.Seq
@@ -410,6 +463,56 @@ func openBrowser(url string) error {
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
 	return cmd.Start()
+}
+
+// composeDraft spawns $EDITOR on an empty temp file. On editor exit, the
+// file contents (after stripping #-comment lines + trimming) become the
+// draft body. Empty bodies are dropped without state change.
+func (m *Model) composeDraft(path string, line int, side string) tea.Cmd {
+	f, err := os.CreateTemp("", "gitreview-draft-*.md")
+	if err != nil {
+		m.statusMsg = "compose: " + err.Error()
+		return nil
+	}
+	f.Close()
+	cmd := editorCmd(f.Name(), 1)
+	if cmd == nil {
+		m.statusMsg = "compose: no editor found (set $EDITOR)"
+		_ = os.Remove(f.Name())
+		return nil
+	}
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		defer os.Remove(f.Name())
+		if err != nil {
+			return draftComposedMsg{err: err}
+		}
+		raw, readErr := os.ReadFile(f.Name())
+		if readErr != nil {
+			return draftComposedMsg{err: readErr}
+		}
+		body := stripDraftComments(string(raw))
+		return draftComposedMsg{
+			draft: ctxpane.Draft{Path: path, Line: line, Side: side, Body: body},
+		}
+	})
+}
+
+// stripDraftComments removes lines starting with # and trims surrounding space.
+func stripDraftComments(s string) string {
+	var keep []string
+	for _, ln := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
+			continue
+		}
+		keep = append(keep, ln)
+	}
+	return strings.TrimSpace(strings.Join(keep, "\n"))
+}
+
+// draftComposedMsg is delivered after the compose editor exits.
+type draftComposedMsg struct {
+	draft ctxpane.Draft
+	err   error
 }
 
 func (m *Model) openInEditor() tea.Cmd {

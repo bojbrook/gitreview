@@ -470,7 +470,7 @@ func TestPRModeHeader(t *testing.T) {
 		State:   "open",
 		HTMLURL: "https://github.com/foo/bar/pull/42",
 	}
-	m := New(fakeDiff(), nil, "", meta)
+	m := New(fakeDiff(), nil, "", &PRBundle{Meta: meta})
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
 	m = updated.(Model)
 	out := m.View()
