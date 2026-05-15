@@ -112,4 +112,10 @@ var (
 	prDraftStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("214")).
 			Bold(true)
+
+	// commentMarkerStyle is the gutter glyph on diff lines that have at
+	// least one inline review comment or draft anchored to them.
+	commentMarkerStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("214")).
+				Bold(true)
 )

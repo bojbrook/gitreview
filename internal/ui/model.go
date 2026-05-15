@@ -55,10 +55,12 @@ type Model struct {
 	contextPaneVisible     bool // user-toggled; default true
 	contextPayload         ctxpane.Payload
 	contextCursor          ctxpane.Cursor
-	contextSelected        int   // currently highlighted item index when pane is focused
-	contextRefreshSeq      int   // monotonic; used to ignore stale debounced ticks
-	contextHistoryExpanded bool  // toggled by H when pane is focused
-	hunkOffsets            []int // viewport line indices of each hunk in the current file
+	contextSelected        int       // currently highlighted item index when pane is focused
+	contextRefreshSeq      int       // monotonic; used to ignore stale debounced ticks
+	contextHistoryExpanded bool      // toggled by H when pane is focused
+	hunkOffsets            []int     // viewport line indices of each hunk in the current file
+	diffRows               []diffRow // row metadata for the current file (unified view)
+	diffCursor             int       // index into diffRows; always points at a line row in viewChanges
 	width                  int
 	height                 int
 	forcedWidth            int
@@ -115,8 +117,8 @@ type composeKind int
 const (
 	composeNewDraft composeKind = iota
 	composeEditDraft
-	composeBody    // B: edit review body, no submit
-	composeSubmit  // S: edit review body + submit drafts on Ctrl+s
+	composeBody   // B: edit review body, no submit
+	composeSubmit // S: edit review body + submit drafts on Ctrl+s
 )
 
 type modalAnchor struct {
@@ -412,6 +414,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.focus == paneLeft {
 				return m, m.moveCursor(+1)
 			}
+			// paneDiff: move the per-line cursor (unified view) or scroll (split).
+			if m.view == viewChanges && !m.splitView && len(m.diffRows) > 0 {
+				next := nextLineRow(m.diffRows, m.diffCursor)
+				if next != m.diffCursor {
+					m.diffCursor = next
+					m.ensureCursorVisible()
+					m.rerenderDiffCursor()
+					return m, m.scheduleContextRefresh()
+				}
+				return m, nil
+			}
 			m.viewport.ScrollDown(1)
 			return m, m.maybeScheduleHunkChange()
 		case "k", "up":
@@ -425,6 +438,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.focus == paneLeft {
 				return m, m.moveCursor(-1)
+			}
+			if m.view == viewChanges && !m.splitView && len(m.diffRows) > 0 {
+				prev := prevLineRow(m.diffRows, m.diffCursor)
+				if prev != m.diffCursor {
+					m.diffCursor = prev
+					m.ensureCursorVisible()
+					m.rerenderDiffCursor()
+					return m, m.scheduleContextRefresh()
+				}
+				return m, nil
 			}
 			m.viewport.ScrollUp(1)
 			return m, m.maybeScheduleHunkChange()
@@ -563,15 +586,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "C: place cursor on a diff line first"
 				return m, nil
 			}
-			cur := ctxpane.Cursor{File: fr, HunkIndex: m.currentHunkIndex()}
-			line, kind, ok := cur.AnchorLine()
-			if !ok || line == 0 {
-				m.statusMsg = "C: no anchor line in this hunk"
+			line, side := m.currentDiffAnchor()
+			if line == 0 {
+				m.statusMsg = "C: no anchor line at the cursor"
 				return m, nil
-			}
-			side := "RIGHT"
-			if kind == diff.LineRemoved {
-				side = "LEFT"
 			}
 			return m, m.openComposeModal(composeNewDraft, fr.Path, line, side, -1, "")
 		case "B":
@@ -600,14 +618,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok {
 				return m, nil
 			}
-			cur := ctxpane.Cursor{File: fr, HunkIndex: m.currentHunkIndex()}
-			line, kind, ok := cur.AnchorLine()
-			if !ok || line == 0 {
+			line, side := m.currentDiffAnchor()
+			if line == 0 {
 				return m, nil
-			}
-			side := "RIGHT"
-			if kind == diff.LineRemoved {
-				side = "LEFT"
 			}
 			entries := buildThread(m.reviewComments, m.drafts, fr.Path, line, side)
 			if len(entries) == 0 {
@@ -679,6 +692,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Seq != m.contextRefreshSeq {
 			return m, nil // stale
 		}
+		anchorLine, anchorSide := m.currentDiffAnchor()
 		cur := ctxpane.Cursor{
 			File:            m.currentFileForContext(),
 			HunkIndex:       m.currentHunkIndex(),
@@ -687,6 +701,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			HistoryExpanded: m.contextHistoryExpanded,
 			ReviewComments:  m.reviewComments,
 			Drafts:          m.drafts,
+			CurrentLine:     anchorLine,
+			CurrentSide:     anchorSide,
 		}
 		m.contextCursor = cur
 		seq := msg.Seq
@@ -811,6 +827,98 @@ func (m *Model) doSubmit(body string) tea.Cmd {
 type submitDoneMsg struct {
 	n   int
 	err error
+}
+
+// firstLineRow returns the first index in rows whose IsLine is true, or 0
+// when no line rows exist.
+func firstLineRow(rows []diffRow) int {
+	for i, r := range rows {
+		if r.IsLine {
+			return i
+		}
+	}
+	return 0
+}
+
+// nextLineRow / prevLineRow walk rows looking for the next/prev IsLine
+// entry; stops at the bounds (clamps).
+func nextLineRow(rows []diffRow, from int) int {
+	for i := from + 1; i < len(rows); i++ {
+		if rows[i].IsLine {
+			return i
+		}
+	}
+	return from
+}
+
+func prevLineRow(rows []diffRow, from int) int {
+	for i := from - 1; i >= 0; i-- {
+		if rows[i].IsLine {
+			return i
+		}
+	}
+	return from
+}
+
+// commentedLineMap collapses m.reviewComments + m.drafts into a set of
+// (path, line, side) keys for the diff renderer to mark.
+func (m Model) commentedLineMap() map[diffLineKey]bool {
+	if len(m.reviewComments) == 0 && len(m.drafts) == 0 {
+		return nil
+	}
+	out := make(map[diffLineKey]bool, len(m.reviewComments)+len(m.drafts))
+	for _, c := range m.reviewComments {
+		out[diffLineKey{Path: c.Path, Line: c.Line, Side: c.Side}] = true
+	}
+	for _, d := range m.drafts {
+		out[diffLineKey{Path: d.Path, Line: d.Line, Side: d.Side}] = true
+	}
+	return out
+}
+
+// rerenderDiffCursor re-renders the current file with the updated diffCursor
+// highlight in place. Cheaper than a full refreshDiff because tree/state
+// don't change.
+func (m *Model) rerenderDiffCursor() {
+	if m.view != viewChanges || m.splitView {
+		return
+	}
+	fr, _, ok := m.currentFileRow()
+	if !ok {
+		return
+	}
+	m.viewport.SetContent(renderDiff(fr, m.viewport.Width, diffRenderOpts{
+		CursorRow: m.diffCursor,
+		Commented: m.commentedLineMap(),
+	}))
+}
+
+// currentDiffAnchor returns the (line, side) of the row under the diff
+// cursor, or (0, "") when the cursor is not on a valid line row.
+func (m Model) currentDiffAnchor() (int, string) {
+	if m.diffCursor < 0 || m.diffCursor >= len(m.diffRows) {
+		return 0, ""
+	}
+	r := m.diffRows[m.diffCursor]
+	if !r.IsLine {
+		return 0, ""
+	}
+	return r.Line, r.Side
+}
+
+// ensureCursorVisible nudges the viewport's YOffset so the diff cursor row
+// is on-screen. Called after diffCursor moves.
+func (m *Model) ensureCursorVisible() {
+	if m.viewport.Height <= 0 {
+		return
+	}
+	top := m.viewport.YOffset
+	bot := top + m.viewport.Height - 1
+	if m.diffCursor < top {
+		m.viewport.SetYOffset(m.diffCursor)
+	} else if m.diffCursor > bot {
+		m.viewport.SetYOffset(m.diffCursor - m.viewport.Height + 1)
+	}
 }
 
 // runRefetch kicks off the configured refetcher in a Cmd; result delivers
@@ -1328,25 +1436,36 @@ func (m *Model) jumpHunk(dir int) {
 		return
 	}
 	cur := m.viewport.YOffset
+	target := m.viewport.YOffset
 	if dir > 0 {
+		target = m.hunkOffsets[len(m.hunkOffsets)-1]
 		for _, off := range m.hunkOffsets {
 			if off > cur {
-				m.viewport.SetYOffset(off)
+				target = off
+				break
+			}
+		}
+	} else {
+		target = m.hunkOffsets[0]
+		for _, off := range m.hunkOffsets {
+			if off >= cur {
+				break
+			}
+			target = off
+		}
+	}
+	m.viewport.SetYOffset(target)
+	// Snap the per-line cursor to the first line row of the target hunk
+	// so the highlight stays in sync with what's on screen.
+	if m.view == viewChanges && !m.splitView && len(m.diffRows) > 0 {
+		for i := target; i < len(m.diffRows); i++ {
+			if m.diffRows[i].IsLine {
+				m.diffCursor = i
+				m.rerenderDiffCursor()
 				return
 			}
 		}
-		// already past last hunk — go to last
-		m.viewport.SetYOffset(m.hunkOffsets[len(m.hunkOffsets)-1])
-		return
 	}
-	target := m.hunkOffsets[0]
-	for _, off := range m.hunkOffsets {
-		if off >= cur {
-			break
-		}
-		target = off
-	}
-	m.viewport.SetYOffset(target)
 }
 
 // --- mode + cursor helpers ---
@@ -1776,8 +1895,16 @@ func (m *Model) refreshDiff() {
 		if m.splitView {
 			m.viewport.SetContent(renderSplit(fr, m.viewport.Width))
 			m.hunkOffsets = hunkOffsetsSplit(fr)
+			m.diffRows = nil
 		} else {
-			m.viewport.SetContent(renderDiff(fr, m.viewport.Width))
+			m.diffRows = buildDiffRows(fr)
+			if m.diffCursor < 0 || m.diffCursor >= len(m.diffRows) || !m.diffRows[m.diffCursor].IsLine {
+				m.diffCursor = firstLineRow(m.diffRows)
+			}
+			m.viewport.SetContent(renderDiff(fr, m.viewport.Width, diffRenderOpts{
+				CursorRow: m.diffCursor,
+				Commented: m.commentedLineMap(),
+			}))
 			m.hunkOffsets = hunkOffsetsUnified(fr)
 		}
 	} else {

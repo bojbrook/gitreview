@@ -84,6 +84,12 @@ type Cursor struct {
 	// user's pending unsubmitted comments; same filter.
 	ReviewComments []CommentRef
 	Drafts         []Draft
+
+	// CurrentLine + CurrentSide, when CurrentLine > 0, override AnchorLine()
+	// to return (CurrentLine, kind-from-side). Lets the UI's per-line diff
+	// cursor drive the anchor instead of the heuristic first-of-hunk.
+	CurrentLine int
+	CurrentSide string // "LEFT" | "RIGHT"
 }
 
 // CommentRef is the package-internal shape of a review comment. The pr
@@ -125,7 +131,18 @@ type ReviewDisplay struct {
 // AnchorLine returns the OldNum (for removed lines) or NewNum (otherwise)
 // of the first non-context-blank line in the current hunk, plus its Kind.
 // Returns (0, LineContext, false) if the hunk has nothing usable.
+//
+// When the caller has set CurrentLine > 0 (typically from the UI's per-line
+// diff cursor), the override is returned directly with kind inferred from
+// CurrentSide.
 func (c Cursor) AnchorLine() (lineNum int, kind diff.LineKind, ok bool) {
+	if c.CurrentLine > 0 {
+		k := diff.LineContext
+		if c.CurrentSide == "LEFT" {
+			k = diff.LineRemoved
+		}
+		return c.CurrentLine, k, true
+	}
 	if c.HunkIndex < 0 || c.HunkIndex >= len(c.File.Hunks) {
 		return 0, diff.LineContext, false
 	}
