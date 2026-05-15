@@ -13,6 +13,7 @@ import (
 	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	"github.com/bowenbrooks/gitreview/internal/pr"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -97,7 +98,24 @@ type Model struct {
 	modalEntries  []threadEntry
 	modalSelected int
 	modalAnchor   modalAnchor
+
+	// Compose modal state — in-TUI textarea for C / e (inline drafts).
+	composeOpen    bool
+	composeArea    textarea.Model
+	composeKind    composeKind
+	composePath    string
+	composeLine    int
+	composeSide    string
+	composeEditIdx int  // valid only when composeKind == composeEditDraft
+	composeFromMod bool // true when modal opened from thread modal (re-open on save)
 }
+
+type composeKind int
+
+const (
+	composeNewDraft composeKind = iota
+	composeEditDraft
+)
 
 type modalAnchor struct {
 	Path string
@@ -222,6 +240,66 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.filtering {
 			return m.handleFilterKey(msg)
 		}
+		// Compose modal traps all keys when open. Esc cancels; Ctrl+s saves.
+		// Everything else routes to the textarea.
+		if m.composeOpen {
+			switch msg.String() {
+			case "esc":
+				wasFromMod := m.composeFromMod
+				wasPath := m.composePath
+				wasLine := m.composeLine
+				wasSide := m.composeSide
+				m.composeOpen = false
+				m.composeFromMod = false
+				m.statusMsg = "compose: cancelled"
+				if wasFromMod {
+					entries := buildThread(m.reviewComments, m.drafts, wasPath, wasLine, wasSide)
+					if len(entries) > 0 {
+						m.modalOpen = true
+						m.modalEntries = entries
+						m.modalSelected = 0
+						m.modalAnchor = modalAnchor{Path: wasPath, Line: wasLine, Side: wasSide}
+					}
+				}
+				return m, nil
+			case "ctrl+s":
+				body := strings.TrimSpace(m.composeArea.Value())
+				m.composeOpen = false
+				if body == "" {
+					if m.composeKind == composeEditDraft && m.composeEditIdx >= 0 && m.composeEditIdx < len(m.drafts) {
+						m.drafts = append(m.drafts[:m.composeEditIdx], m.drafts[m.composeEditIdx+1:]...)
+						m.statusMsg = "draft deleted (empty save)"
+					} else {
+						m.statusMsg = "compose: cancelled (empty)"
+					}
+				} else {
+					switch m.composeKind {
+					case composeNewDraft:
+						m.drafts = append(m.drafts, ctxpane.Draft{Path: m.composePath, Line: m.composeLine, Side: m.composeSide, Body: body})
+						m.statusMsg = fmt.Sprintf("draft saved (%d total)", len(m.drafts))
+					case composeEditDraft:
+						if m.composeEditIdx >= 0 && m.composeEditIdx < len(m.drafts) {
+							m.drafts[m.composeEditIdx].Body = body
+							m.statusMsg = "draft updated"
+						}
+					}
+				}
+				if m.composeFromMod {
+					entries := buildThread(m.reviewComments, m.drafts, m.composePath, m.composeLine, m.composeSide)
+					if len(entries) > 0 {
+						m.modalOpen = true
+						m.modalEntries = entries
+						m.modalSelected = 0
+						m.modalAnchor = modalAnchor{Path: m.composePath, Line: m.composeLine, Side: m.composeSide}
+					}
+				}
+				m.composeFromMod = false
+				return m, m.scheduleContextRefresh()
+			}
+			var cmd tea.Cmd
+			m.composeArea, cmd = m.composeArea.Update(msg)
+			return m, cmd
+		}
 		// Modal traps all keys when open.
 		if m.modalOpen {
 			switch msg.String() {
@@ -257,8 +335,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "e":
 				if m.modalSelected >= 0 && m.modalSelected < len(m.modalEntries) {
 					e := m.modalEntries[m.modalSelected]
-					if e.IsDraft {
-						return m, m.editDraft(e.DraftIdx)
+					if e.IsDraft && e.DraftIdx >= 0 && e.DraftIdx < len(m.drafts) {
+						d := m.drafts[e.DraftIdx]
+						m.modalOpen = false
+						return m, m.openComposeModal(composeEditDraft, d.Path, d.Line, d.Side, e.DraftIdx, d.Body)
 					}
 				}
 				return m, nil
@@ -467,7 +547,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if kind == diff.LineRemoved {
 				side = "LEFT"
 			}
-			return m, m.composeDraft(fr.Path, line, side)
+			return m, m.openComposeModal(composeNewDraft, fr.Path, line, side, -1, "")
 		case "B":
 			if m.prMeta == nil {
 				return m, nil
@@ -544,19 +624,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case draftComposedMsg:
-		if msg.err != nil {
-			m.statusMsg = "compose: " + msg.err.Error()
-			return m, nil
-		}
-		if msg.draft.Body == "" {
-			m.statusMsg = "compose: cancelled (empty)"
-			return m, nil
-		}
-		m.drafts = append(m.drafts, msg.draft)
-		m.statusMsg = fmt.Sprintf("draft saved (%d total)", len(m.drafts))
-		return m, m.scheduleContextRefresh()
-
 	case reviewBodyComposedMsg:
 		if msg.err != nil {
 			m.statusMsg = "B: " + msg.err.Error()
@@ -588,30 +655,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reviewComments = msg.res.ReviewComments
 			m.issueComments = msg.res.IssueComments
 			m.reviews = msg.res.Reviews
-		}
-		return m, m.scheduleContextRefresh()
-
-	case draftEditedMsg:
-		if msg.err != nil {
-			m.statusMsg = "edit: " + msg.err.Error()
-			return m, nil
-		}
-		if msg.idx < 0 || msg.idx >= len(m.drafts) {
-			return m, nil
-		}
-		if msg.body == "" {
-			m.drafts = append(m.drafts[:msg.idx], m.drafts[msg.idx+1:]...)
-		} else {
-			m.drafts[msg.idx].Body = msg.body
-		}
-		if m.modalOpen {
-			m.modalEntries = buildThread(m.reviewComments, m.drafts, m.modalAnchor.Path, m.modalAnchor.Line, m.modalAnchor.Side)
-			if m.modalSelected >= len(m.modalEntries) {
-				m.modalSelected = maxInt(0, len(m.modalEntries)-1)
-			}
-			if len(m.modalEntries) == 0 {
-				m.modalOpen = false
-			}
 		}
 		return m, m.scheduleContextRefresh()
 
@@ -669,113 +712,28 @@ func openBrowser(url string) error {
 // composeDraft spawns $EDITOR on an empty temp file. On editor exit, the
 // file contents (after stripping #-comment lines + trimming) become the
 // draft body. Empty bodies are dropped without state change.
-func (m *Model) composeDraft(path string, line int, side string) tea.Cmd {
-	f, err := os.CreateTemp("", "gitreview-draft-*.md")
-	if err != nil {
-		m.statusMsg = "compose: " + err.Error()
-		return nil
-	}
-	// Pre-populate with a context header so the editor isn't a blank slate.
-	// All lines are #-prefixed and stripped by stripDraftComments on save.
-	if fr, _, ok := m.currentFileRow(); ok {
-		header := commentContextHeader(fr, line, side)
-		if _, err := f.WriteString(header); err != nil {
-			f.Close()
-			os.Remove(f.Name())
-			m.statusMsg = "compose: " + err.Error()
-			return nil
-		}
-	}
-	f.Close()
-	cmd := editorCmd(f.Name(), 1)
-	if cmd == nil {
-		m.statusMsg = "compose: no editor found (set $EDITOR)"
-		_ = os.Remove(f.Name())
-		return nil
-	}
-	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		defer os.Remove(f.Name())
-		if err != nil {
-			return draftComposedMsg{err: err}
-		}
-		raw, readErr := os.ReadFile(f.Name())
-		if readErr != nil {
-			return draftComposedMsg{err: readErr}
-		}
-		body := stripDraftComments(string(raw))
-		return draftComposedMsg{
-			draft: ctxpane.Draft{Path: path, Line: line, Side: side, Body: body},
-		}
-	})
-}
-
-// commentContextHeader returns a #-prefixed header showing the file, line,
-// side, and ~6 surrounding diff lines (cursor line marked with >). All lines
-// start with "#" so stripDraftComments removes them on save.
-func commentContextHeader(f diff.File, line int, side string) string {
-	type entry struct {
-		prefix   string // " " "+" "-"
-		num      int
-		text     string
-		isAnchor bool
-	}
-	var entries []entry
-	for _, h := range f.Hunks {
-		for _, l := range h.Lines {
-			prefix := " "
-			num := l.NewNum
-			switch l.Kind {
-			case diff.LineAdded:
-				prefix = "+"
-			case diff.LineRemoved:
-				prefix = "-"
-				num = l.OldNum
-			}
-			isAnchor := false
-			if side == "RIGHT" && l.Kind != diff.LineRemoved && l.NewNum == line {
-				isAnchor = true
-			} else if side == "LEFT" && l.Kind != diff.LineAdded && l.OldNum == line {
-				isAnchor = true
-			}
-			entries = append(entries, entry{prefix, num, l.Content, isAnchor})
-		}
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "# Commenting on %s:%d (%s side)\n#\n", f.Path, line, side)
-
-	anchorIdx := -1
-	for i, e := range entries {
-		if e.isAnchor {
-			anchorIdx = i
-			break
-		}
-	}
-	if anchorIdx >= 0 {
-		fmt.Fprintln(&b, "# Context (cursor line marked >):")
-		fmt.Fprintln(&b, "#")
-		start := anchorIdx - 3
-		if start < 0 {
-			start = 0
-		}
-		end := anchorIdx + 4
-		if end > len(entries) {
-			end = len(entries)
-		}
-		for i := start; i < end; i++ {
-			e := entries[i]
-			marker := " "
-			if i == anchorIdx {
-				marker = ">"
-			}
-			fmt.Fprintf(&b, "# %s  %s %4d  %s\n", marker, e.prefix, e.num, e.text)
-		}
-		fmt.Fprintln(&b, "#")
-	}
-
-	fmt.Fprintln(&b, "# Write your comment below. Lines starting with # are stripped.")
-	fmt.Fprintln(&b)
-	return b.String()
+// openComposeModal initialises and shows the in-TUI textarea for composing
+// or editing a single inline comment. When called from inside the thread
+// modal (editDraft path), composeFromMod is set so the thread modal
+// re-opens automatically after save/cancel. initialBody seeds the textarea
+// for edits; empty for new drafts.
+func (m *Model) openComposeModal(kind composeKind, path string, line int, side string, editIdx int, initialBody string) tea.Cmd {
+	ta := textarea.New()
+	ta.Placeholder = "Write your comment…"
+	ta.CharLimit = 64 * 1024
+	ta.SetValue(initialBody)
+	ta.ShowLineNumbers = false
+	// Size set in View() where m.width/m.height are known.
+	cmd := ta.Focus()
+	m.composeArea = ta
+	m.composeOpen = true
+	m.composeKind = kind
+	m.composePath = path
+	m.composeLine = line
+	m.composeSide = side
+	m.composeEditIdx = editIdx
+	m.composeFromMod = (kind == composeEditDraft)
+	return cmd
 }
 
 // stripDraftComments removes lines starting with # and trims surrounding space.
@@ -788,64 +746,6 @@ func stripDraftComments(s string) string {
 		keep = append(keep, ln)
 	}
 	return strings.TrimSpace(strings.Join(keep, "\n"))
-}
-
-// draftComposedMsg is delivered after the compose editor exits.
-type draftComposedMsg struct {
-	draft ctxpane.Draft
-	err   error
-}
-
-// editDraft re-spawns $EDITOR with the existing draft body. Empty save = delete.
-func (m *Model) editDraft(idx int) tea.Cmd {
-	if idx < 0 || idx >= len(m.drafts) {
-		return nil
-	}
-	d := m.drafts[idx]
-	f, err := os.CreateTemp("", "gitreview-draft-*.md")
-	if err != nil {
-		m.statusMsg = "edit: " + err.Error()
-		return nil
-	}
-	// Re-prepend context header so the user still sees what they're editing.
-	var initial string
-	for _, file := range m.d.Files {
-		if file.Path == d.Path {
-			initial = commentContextHeader(file, d.Line, d.Side)
-			break
-		}
-	}
-	initial += d.Body
-	if _, err := f.WriteString(initial); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		m.statusMsg = "edit: " + err.Error()
-		return nil
-	}
-	f.Close()
-	cmd := editorCmd(f.Name(), 1)
-	if cmd == nil {
-		m.statusMsg = "edit: no editor found (set $EDITOR)"
-		os.Remove(f.Name())
-		return nil
-	}
-	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		defer os.Remove(f.Name())
-		if err != nil {
-			return draftEditedMsg{idx: idx, err: err}
-		}
-		raw, readErr := os.ReadFile(f.Name())
-		if readErr != nil {
-			return draftEditedMsg{idx: idx, err: readErr}
-		}
-		return draftEditedMsg{idx: idx, body: stripDraftComments(string(raw))}
-	})
-}
-
-type draftEditedMsg struct {
-	idx  int
-	body string
-	err  error
 }
 
 // composeReviewBody opens $EDITOR with the current m.reviewBody as the
@@ -1065,7 +965,9 @@ func (m Model) View() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 	}
 	view := lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderHelp())
-	if m.modalOpen {
+	if m.composeOpen {
+		view = m.renderComposeOverlay()
+	} else if m.modalOpen {
 		modalW := minInt(m.width-4, 80)
 		innerW := modalW - 6
 		title := fmt.Sprintf("Thread: %s:%d", m.modalAnchor.Path, m.modalAnchor.Line)
@@ -1075,6 +977,133 @@ func (m Model) View() string {
 			lipgloss.WithWhitespaceChars(" "))
 	}
 	return view
+}
+
+// renderComposeOverlay draws the in-TUI compose modal: header with file/line,
+// context block with surrounding diff lines (cursor line marked), the
+// textarea itself, and a help line.
+func (m Model) renderComposeOverlay() string {
+	modalW := minInt(m.width-4, 90)
+	innerW := modalW - 6 // border + padding
+
+	var b strings.Builder
+	verb := "Comment"
+	if m.composeKind == composeEditDraft {
+		verb = "Edit"
+	}
+	fmt.Fprintf(&b, "%s\n\n", titleStyle.Render(fmt.Sprintf("%s on %s:%d (%s side)", verb, m.composePath, m.composeLine, m.composeSide)))
+
+	// Context block (uncommented — visual, not text-form #).
+	if fr, ok := m.fileByPath(m.composePath); ok {
+		ctx := composeContextBlock(fr, m.composeLine, m.composeSide, innerW)
+		if ctx != "" {
+			b.WriteString(ctx)
+			b.WriteString("\n\n")
+		}
+	}
+
+	// Size the textarea: take up remaining vertical room, capped.
+	taH := 8
+	if m.height > 0 {
+		// Leave room for: title (2 lines), context (~7), help (1), borders (3).
+		avail := m.height - 16
+		if avail > taH {
+			taH = minInt(avail, 18)
+		}
+	}
+	m.composeArea.SetWidth(innerW - 2)
+	m.composeArea.SetHeight(taH)
+	b.WriteString(m.composeArea.View())
+	b.WriteString("\n\n")
+	b.WriteString(mutedStyle.Render(" Ctrl+s save · Esc cancel"))
+
+	modal := modalStyle.Width(modalW).Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+		lipgloss.WithWhitespaceChars(" "))
+}
+
+// fileByPath returns the diff.File matching path, scanning the current diff.
+func (m Model) fileByPath(path string) (diff.File, bool) {
+	if m.d == nil {
+		return diff.File{}, false
+	}
+	for _, f := range m.d.Files {
+		if f.Path == path {
+			return f, true
+		}
+	}
+	return diff.File{}, false
+}
+
+// composeContextBlock renders ~6 diff lines around the anchor as plain styled
+// text (with > marking the cursor line). Width-truncated.
+func composeContextBlock(f diff.File, line int, side string, width int) string {
+	type entry struct {
+		prefix   string
+		num      int
+		text     string
+		isAnchor bool
+	}
+	var entries []entry
+	for _, h := range f.Hunks {
+		for _, l := range h.Lines {
+			prefix := " "
+			num := l.NewNum
+			switch l.Kind {
+			case diff.LineAdded:
+				prefix = "+"
+			case diff.LineRemoved:
+				prefix = "-"
+				num = l.OldNum
+			}
+			anchor := false
+			if side == "RIGHT" && l.Kind != diff.LineRemoved && l.NewNum == line {
+				anchor = true
+			} else if side == "LEFT" && l.Kind != diff.LineAdded && l.OldNum == line {
+				anchor = true
+			}
+			entries = append(entries, entry{prefix, num, l.Content, anchor})
+		}
+	}
+	anchorIdx := -1
+	for i, e := range entries {
+		if e.isAnchor {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx < 0 {
+		return ""
+	}
+	start := anchorIdx - 3
+	if start < 0 {
+		start = 0
+	}
+	end := anchorIdx + 4
+	if end > len(entries) {
+		end = len(entries)
+	}
+	var b strings.Builder
+	b.WriteString(mutedStyle.Render("context:"))
+	b.WriteString("\n")
+	for i := start; i < end; i++ {
+		e := entries[i]
+		marker := " "
+		if i == anchorIdx {
+			marker = ">"
+		}
+		row := fmt.Sprintf("%s  %s %4d  %s", marker, e.prefix, e.num, e.text)
+		if len(row) > width {
+			row = row[:width]
+		}
+		if i == anchorIdx {
+			b.WriteString(prHeaderStyle.Render(row))
+		} else {
+			b.WriteString(mutedStyle.Render(row))
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // renderTopHeader is a single-line strip showing the three view tabs and PR
