@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
+	"github.com/bowenbrooks/gitreview/internal/pr"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -76,6 +79,8 @@ type Model struct {
 	// Keyed by file path. Persists for the lifetime of the program; not stored
 	// to disk yet.
 	reviewedFiles map[string]bool
+
+	prMeta *pr.PRMeta // non-nil when running in PR mode
 }
 
 // ForceWidth overrides the terminal width bubbletea reports. Useful when
@@ -84,7 +89,7 @@ func (m *Model) ForceWidth(w int) {
 	m.forcedWidth = w
 }
 
-func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
+func New(d *diff.Diff, commits []diff.Commit, repoRoot string, prMeta *pr.PRMeta) Model {
 	ti := textinput.New()
 	ti.Prompt = "/"
 	ti.Placeholder = "filter files…"
@@ -100,6 +105,7 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string) Model {
 		reviewedFiles:      map[string]bool{},
 		contextPaneVisible: true,
 		treeCollapsed:      map[string]bool{},
+		prMeta:             prMeta,
 	}
 }
 
@@ -317,6 +323,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "e":
 			return m, m.openInEditor()
+		case "O":
+			if m.prMeta == nil {
+				return m, nil
+			}
+			if err := openBrowser(m.prMeta.HTMLURL); err != nil {
+				m.statusMsg = "browser: " + err.Error()
+			}
+			return m, nil
 		case "s":
 			if m.view == viewChanges {
 				m.splitView = !m.splitView
@@ -382,6 +396,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // openInEditor launches $EDITOR on the currently selected file at its first
 // hunk's new-side line. Returns nil (no-op) if there's no editable file.
+// openBrowser opens the given URL in the user's default browser.
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "linux":
+		cmd = exec.Command("xdg-open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+	return cmd.Start()
+}
+
 func (m *Model) openInEditor() tea.Cmd {
 	f, line, ok := m.selectedEditTarget()
 	if !ok {
@@ -469,7 +499,15 @@ func (m Model) View() string {
 func (m Model) renderTopHeader() string {
 	tabs := m.renderTabsGlobal()
 	stats := m.renderStats()
-	return padBetweenAnsi(tabs, stats, m.width)
+	if m.prMeta == nil {
+		return padBetweenAnsi(tabs, stats, m.width)
+	}
+	prStrip := prHeaderStyle.Render(fmt.Sprintf(
+		"PR #%d · %s · %s   ",
+		m.prMeta.Number, m.prMeta.Author, m.prMeta.State,
+	))
+	openHint := mutedStyle.Render("   O: open in browser")
+	return padBetweenAnsi(prStrip+tabs, stats+openHint, m.width)
 }
 
 func (m Model) renderTabsGlobal() string {

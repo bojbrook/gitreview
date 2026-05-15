@@ -57,6 +57,18 @@ Special case: a repo with no `HEAD` (fresh `git init` with no commits) falls bac
 - **Pre-flight first.** Inbound PR triage is deferred but planned; keep `Diff`/`File`/`Hunk`/`Commit` general enough that the same UI works for both. Don't add GitHub-specific types to `internal/diff/`.
 - **No daemon, no async fetch.** Commit diffs are lazy-loaded sync on cursor move. This is fine because `git show` is fast on local repos; revisit only if it becomes a bottleneck.
 
+## Commit conventions
+
+When you commit on this repo:
+
+- Use a single-line subject — no body unless the user asks for one.
+- Subject format: `<area>: <imperative summary>`, e.g. `ui: render context pane as third column`, `pr: parse PR refs`.
+- **Do not** add the `Co-Authored-By: Claude …` trailer.
+- **Do not** add the `🤖 Generated with Claude Code` line.
+- Use `git commit -m "<subject>"` directly. No HEREDOC body templates.
+
+If the change genuinely needs more context than fits in the subject (rare), keep the body to 1–2 short sentences and still skip the Claude trailer.
+
 ## Persistent project memory
 
 Long-lived context for this project (decisions, MVP scope, why the stack was chosen) lives in `~/.claude/projects/-Users-bowen-brooks-Documents-git-review/memory/`. Read `MEMORY.md` there at session start if catching up.
