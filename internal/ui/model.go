@@ -1313,13 +1313,6 @@ func stripAnsiForCursor(r treeRow, m Model, rowW, sparkW int, showSpark bool) st
 	return ""
 }
 
-func padBetweenPlain(left, right string, width int) string {
-	if len(left)+len(right) >= width {
-		return left
-	}
-	return left + strings.Repeat(" ", width-len(left)-len(right)) + right
-}
-
 func (m Model) renderCommitsList(leftW int) string {
 	if len(m.commits) == 0 {
 		return mutedStyle.Render("(no commits)")
