@@ -12,6 +12,7 @@ const (
 	SectionCrossFile
 	SectionBlame
 	SectionHistory
+	SectionComments
 )
 
 func (k SectionKind) Title() string {
@@ -26,6 +27,8 @@ func (k SectionKind) Title() string {
 		return "Blame"
 	case SectionHistory:
 		return "History"
+	case SectionComments:
+		return "Comments"
 	}
 	return "?"
 }
@@ -75,6 +78,32 @@ type Cursor struct {
 	Diff            *diff.Diff // the full diff (so cross-file sections can scan other files)
 	RepoRoot        string     // absolute path to the working-tree root
 	HistoryExpanded bool       // true when user pressed H to expand history
+
+	// Comment-related inputs. ReviewComments is the full list for the PR;
+	// the Comments section filters by (Path, Line, Side). Drafts are the
+	// user's pending unsubmitted comments; same filter.
+	ReviewComments []CommentRef
+	Drafts         []Draft
+}
+
+// CommentRef is the package-internal shape of a review comment. The pr
+// package's ReviewComment maps directly to this — kept here so ctxpane has
+// no import on pr.
+type CommentRef struct {
+	User string
+	Path string
+	Line int
+	Side string // "RIGHT" | "LEFT"
+	Body string
+	Age  string // pre-formatted relative time ("2h ago")
+}
+
+// Draft is a locally-authored comment not yet submitted to GitHub.
+type Draft struct {
+	Path string
+	Line int
+	Side string
+	Body string
 }
 
 // AnchorLine returns the OldNum (for removed lines) or NewNum (otherwise)

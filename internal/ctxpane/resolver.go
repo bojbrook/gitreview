@@ -25,6 +25,7 @@ func Resolve(ctx context.Context, cur Cursor) Payload {
 		func(c context.Context) Section { return buildCrossFileSection(c, cur) },
 		func(c context.Context) Section { return buildBlameSection(c, cur) },
 		func(c context.Context) Section { return buildHistorySection(c, cur) },
+		func(c context.Context) Section { return buildCommentsSection(cur) },
 	}
 	out := make([]Section, len(tasks))
 	var wg sync.WaitGroup
@@ -76,6 +77,8 @@ func kindFor(i int) SectionKind {
 		return SectionBlame
 	case 4:
 		return SectionHistory
+	case 5:
+		return SectionComments
 	}
 	panic(fmt.Sprintf("kindFor: no SectionKind for task index %d — update kindFor when adding tasks", i))
 }
