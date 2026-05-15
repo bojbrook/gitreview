@@ -62,18 +62,20 @@ func TestModelNavigation(t *testing.T) {
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
-	// Move cursor down
+	// Move cursor down: starts at 0 (dir row "(root)") → 1 (first file).
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated.(Model)
-	if m.fileCursor != 1 {
-		t.Errorf("cursor after j: got %d want 1", m.fileCursor)
+	if m.rowCursor != 1 {
+		t.Errorf("cursor after j: got %d want 1", m.rowCursor)
 	}
 
-	// Boundary — shouldn't go past last
+	// Move further — 2 files + 1 dir = 3 rows. Last index = 2.
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated.(Model)
-	if m.fileCursor != 1 {
-		t.Errorf("cursor at end after extra j: got %d want 1", m.fileCursor)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(Model)
+	if m.rowCursor != 2 {
+		t.Errorf("cursor at end: got %d want 2", m.rowCursor)
 	}
 
 	// Tab focus
@@ -81,6 +83,24 @@ func TestModelNavigation(t *testing.T) {
 	m = updated.(Model)
 	if m.focus != paneDiff {
 		t.Errorf("focus after tab: got %v want paneDiff", m.focus)
+	}
+}
+
+func TestCurrentFileRow(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Row 0 is the "(root)" dir row.
+	m.rowCursor = 0
+	if _, _, ok := m.currentFileRow(); ok {
+		t.Error("dir row should return ok=false")
+	}
+
+	// Row 1 is the first file.
+	m.rowCursor = 1
+	if f, _, ok := m.currentFileRow(); !ok || f.Path != "main.go" {
+		t.Errorf("file row: ok=%v path=%q want ok=true path=main.go", ok, f.Path)
 	}
 }
 
@@ -261,5 +281,180 @@ func TestContextEscReturnsFocusToDiff(t *testing.T) {
 	m = updated.(Model)
 	if m.focus != paneDiff {
 		t.Errorf("after esc: got %v want paneDiff", m.focus)
+	}
+}
+
+func TestRefreshDiffBuildsTree(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if len(m.treeRows) == 0 {
+		t.Fatal("treeRows should be populated after WindowSizeMsg (which refreshes)")
+	}
+	// fakeDiff has files at root (main.go, added.go) → one "(root)" dir row + 2 file rows.
+	if m.treeRows[0].Kind != rowDir {
+		t.Errorf("row 0: got %+v want dir", m.treeRows[0])
+	}
+}
+
+func TestExpandCollapseEnter(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Row 0 is the "(root)" dir, currently expanded. Pressing Enter collapses it.
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !m.treeCollapsed[""] {
+		t.Error("after Enter on root dir: should be collapsed")
+	}
+	if len(m.treeRows) != 1 {
+		t.Errorf("after collapse: rows=%d want 1 (dir row only)", len(m.treeRows))
+	}
+
+	// Enter again: expand.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.treeCollapsed[""] {
+		t.Error("after second Enter: should be expanded")
+	}
+}
+
+func TestLExpandsThenDescends(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Start: dir row (root, expanded). l should descend to row 1.
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.rowCursor != 1 {
+		t.Errorf("l on expanded dir: cursor=%d want 1", m.rowCursor)
+	}
+
+	// Collapse via Enter, then l should expand (not descend).
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // collapse
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.treeCollapsed[""] {
+		t.Error("l on collapsed dir should expand it")
+	}
+}
+
+func TestHJumpsToParent(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Move cursor onto a file row.
+	m.rowCursor = 1
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = updated.(Model)
+	if m.rowCursor != 0 {
+		t.Errorf("h on file row: cursor=%d want 0 (parent dir)", m.rowCursor)
+	}
+}
+
+func TestMarkReviewedNoOpOnDirRow(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	m.rowCursor = 0 // dir row
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = updated.(Model)
+	if len(m.reviewedFiles) != 0 {
+		t.Errorf("m on dir row should not toggle reviewed; got %d entries", len(m.reviewedFiles))
+	}
+	if m.statusMsg == "" {
+		t.Error("m on dir row should set a status hint")
+	}
+}
+
+func TestMarkReviewedTogglesOnFileRow(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	m.rowCursor = 1 // first file row
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = updated.(Model)
+	if !m.reviewedFiles["main.go"] {
+		t.Errorf("m on file row should mark reviewed; reviewedFiles=%v", m.reviewedFiles)
+	}
+}
+
+func TestNextUnreviewedWalksFileRowsOnly(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Mark first file reviewed, then jump-to-next from the first file row.
+	m.reviewedFiles["main.go"] = true
+	m.rowCursor = 1 // first file (already reviewed)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}})
+	m = updated.(Model)
+	if m.rowCursor != 2 {
+		t.Errorf("M: cursor=%d want 2 (next file)", m.rowCursor)
+	}
+}
+
+func TestFilterPreservesCollapsedAfterClear(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Collapse the (root) dir, then start filtering, then cancel — collapsed should persist.
+	m.rowCursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // collapse root
+	m = updated.(Model)
+	if !m.treeCollapsed[""] {
+		t.Fatal("setup: root should be collapsed")
+	}
+
+	// Start filter; collapsed state is snapshotted but tree is rebuilt with filter
+	// (which force-expands), so visible rows include children. The collapsed
+	// MAP itself should still report "" as collapsed.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // cancel filter
+	m = updated.(Model)
+
+	if !m.treeCollapsed[""] {
+		t.Error("after cancel filter: root should still be collapsed")
+	}
+}
+
+func TestFilterPathPreFilterRestores(t *testing.T) {
+	m := New(fakeDiff(), nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	// Start with cursor on first file (main.go).
+	m.rowCursor = 1
+	if f, _, ok := m.currentFileRow(); !ok || f.Path != "main.go" {
+		t.Fatalf("setup: cursor should be on main.go, got ok=%v f=%+v", ok, f)
+	}
+
+	// Filter "added" → only added.go matches.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, ch := range "added" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+
+	// Clear filter via direct call (the `c` key path is also tested elsewhere).
+	m.clearFilter()
+	if f, _, ok := m.currentFileRow(); !ok || f.Path != "main.go" {
+		t.Errorf("after clear: cursor should restore to main.go, got ok=%v f=%+v", ok, f)
 	}
 }
