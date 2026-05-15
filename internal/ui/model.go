@@ -89,6 +89,7 @@ type Model struct {
 	issueComments  []ctxpane.IssueCommentDisplay
 	reviews        []ctxpane.ReviewDisplay
 	reviewBody     string // composed via B; consumed by S
+	submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
 
 	// Thread modal state.
 	modalOpen     bool
@@ -115,6 +116,7 @@ type PRBundle struct {
 	ReviewComments []ctxpane.CommentRef
 	IssueComments  []ctxpane.IssueCommentDisplay
 	Reviews        []ctxpane.ReviewDisplay
+	Submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
 }
 
 func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Model {
@@ -139,6 +141,7 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Mod
 		m.reviewComments = pb.ReviewComments
 		m.issueComments = pb.IssueComments
 		m.reviews = pb.Reviews
+		m.submitter = pb.Submitter
 	}
 	return m
 }
@@ -457,6 +460,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, m.composeReviewBody()
+		case "S":
+			if m.prMeta == nil {
+				return m, nil
+			}
+			if m.submitter == nil {
+				m.statusMsg = "S: submit unavailable (auth failed at startup)"
+				return m, nil
+			}
+			if len(m.drafts) == 0 {
+				m.statusMsg = "S: no drafts to submit"
+				return m, nil
+			}
+			return m, m.composeAndSubmit()
 		case "t":
 			if m.prMeta == nil || m.view != viewChanges {
 				return m, nil
@@ -536,6 +552,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reviewBody = msg.body
 		m.statusMsg = "review body saved"
 		return m, nil
+
+	case submitDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = "submit failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.drafts = nil
+		m.reviewBody = ""
+		m.statusMsg = fmt.Sprintf("submitted %d %s", msg.n, plural("comment", msg.n))
+		return m, m.scheduleContextRefresh()
 
 	case draftEditedMsg:
 		if msg.err != nil {
@@ -742,6 +768,72 @@ func (m *Model) composeReviewBody() tea.Cmd {
 type reviewBodyComposedMsg struct {
 	body string
 	err  error
+}
+
+// composeAndSubmit opens $EDITOR with the templated body, then POSTs via
+// the configured submitter. On success: clears drafts + reviewBody and
+// triggers a context-pane refresh. On failure: drafts kept, status shown.
+func (m *Model) composeAndSubmit() tea.Cmd {
+	tpl := "# Review body (optional — leave empty for no overall comment).\n# Lines starting with # are stripped.\n#\n"
+	tpl += fmt.Sprintf("# %d inline drafts:\n", len(m.drafts))
+	for _, d := range m.drafts {
+		tpl += fmt.Sprintf("#   %s:%d  %q\n", d.Path, d.Line, truncForTemplate(d.Body, 60))
+	}
+	if m.reviewBody != "" {
+		tpl += "\n" + m.reviewBody
+	}
+	f, err := os.CreateTemp("", "gitreview-submit-*.md")
+	if err != nil {
+		m.statusMsg = "S: " + err.Error()
+		return nil
+	}
+	if _, err := f.WriteString(tpl); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		m.statusMsg = "S: " + err.Error()
+		return nil
+	}
+	f.Close()
+	cmd := editorCmd(f.Name(), 1)
+	if cmd == nil {
+		m.statusMsg = "S: no editor found (set $EDITOR)"
+		os.Remove(f.Name())
+		return nil
+	}
+	draftsSnap := make([]pr.SubmitDraft, len(m.drafts))
+	for i, d := range m.drafts {
+		draftsSnap[i] = pr.SubmitDraft{Path: d.Path, Line: d.Line, Side: d.Side, Body: d.Body}
+	}
+	submitter := m.submitter
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		defer os.Remove(f.Name())
+		if err != nil {
+			return submitDoneMsg{err: err}
+		}
+		raw, readErr := os.ReadFile(f.Name())
+		if readErr != nil {
+			return submitDoneMsg{err: readErr}
+		}
+		body := stripDraftComments(string(raw))
+		if err := submitter(context.Background(), body, draftsSnap); err != nil {
+			return submitDoneMsg{err: err}
+		}
+		return submitDoneMsg{n: len(draftsSnap)}
+	})
+}
+
+func truncForTemplate(s string, n int) string {
+	flat := strings.Join(strings.Fields(s), " ")
+	if len([]rune(flat)) <= n {
+		return flat
+	}
+	r := []rune(flat)
+	return string(r[:n-1]) + "…"
+}
+
+type submitDoneMsg struct {
+	n   int
+	err error
 }
 
 func maxInt(a, b int) int {
@@ -1889,6 +1981,9 @@ func (m Model) renderHelp() string {
 		parts = append([]string{"c clear-filter"}, parts...)
 	} else {
 		parts = append(parts, "c ctx")
+	}
+	if m.prMeta != nil {
+		parts = append(parts, "C: comment", "S: submit", "t: thread", "B: body", "O: browser")
 	}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {

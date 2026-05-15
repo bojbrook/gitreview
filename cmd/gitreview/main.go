@@ -119,11 +119,25 @@ func runPRMode(args []string) {
 			Body:  r.Body,
 		})
 	}
+	submitToken, tokenErr := pr.ResolveToken(ctx)
+	if tokenErr != nil {
+		fmt.Fprintln(os.Stderr, "gitreview: warn: submit disabled (auth):", tokenErr)
+	}
+	var submitter func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	if submitToken != "" {
+		s, sErr := pr.NewSubmitter(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number)
+		if sErr != nil {
+			fmt.Fprintln(os.Stderr, "gitreview: warn: submit disabled (client):", sErr)
+		} else {
+			submitter = s
+		}
+	}
 	m := ui.New(bundle.Diff, bundle.Commits, bundle.WorktreePath, &ui.PRBundle{
 		Meta:           &bundle.Meta,
 		ReviewComments: refs,
 		IssueComments:  ics,
 		Reviews:        rvs,
+		Submitter:      submitter,
 	})
 	if *width > 0 {
 		m.ForceWidth(*width)
