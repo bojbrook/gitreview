@@ -102,9 +102,28 @@ func runPRMode(args []string) {
 			Age:  humanRelative(c.CreatedAt),
 		})
 	}
+	ics := make([]ctxpane.IssueCommentDisplay, 0, len(bundle.IssueComments))
+	for _, c := range bundle.IssueComments {
+		ics = append(ics, ctxpane.IssueCommentDisplay{
+			User: c.User,
+			Age:  humanRelative(c.CreatedAt),
+			Body: c.Body,
+		})
+	}
+	rvs := make([]ctxpane.ReviewDisplay, 0, len(bundle.Reviews))
+	for _, r := range bundle.Reviews {
+		rvs = append(rvs, ctxpane.ReviewDisplay{
+			User:  r.User,
+			State: r.State,
+			Age:   humanRelative(r.SubmittedAt),
+			Body:  r.Body,
+		})
+	}
 	m := ui.New(bundle.Diff, bundle.Commits, bundle.WorktreePath, &ui.PRBundle{
 		Meta:           &bundle.Meta,
 		ReviewComments: refs,
+		IssueComments:  ics,
+		Reviews:        rvs,
 	})
 	if *width > 0 {
 		m.ForceWidth(*width)

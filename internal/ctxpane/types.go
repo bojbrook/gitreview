@@ -106,6 +106,22 @@ type Draft struct {
 	Body string
 }
 
+// IssueCommentDisplay and ReviewDisplay are display-only mirrors of pr's
+// IssueComment / Review. ctxpane has no import on pr; the wiring layer
+// (cmd/gitreview/main.go) maps the wire types into these.
+type IssueCommentDisplay struct {
+	User string
+	Age  string
+	Body string
+}
+
+type ReviewDisplay struct {
+	User  string
+	State string // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+	Age   string
+	Body  string
+}
+
 // AnchorLine returns the OldNum (for removed lines) or NewNum (otherwise)
 // of the first non-context-blank line in the current hunk, plus its Kind.
 // Returns (0, LineContext, false) if the hunk has nothing usable.

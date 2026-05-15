@@ -35,6 +35,7 @@ const (
 	viewChanges viewMode = iota
 	viewCommits
 	viewOverview
+	viewPR
 )
 
 type Model struct {
@@ -85,6 +86,9 @@ type Model struct {
 	// PR comment state — non-empty only in PR mode.
 	reviewComments []ctxpane.CommentRef // fetched, mapped from pr.ReviewComment
 	drafts         []ctxpane.Draft      // in-memory; cleared on submit
+	issueComments  []ctxpane.IssueCommentDisplay
+	reviews        []ctxpane.ReviewDisplay
+	reviewBody     string // composed via B; consumed by S
 
 	// Thread modal state.
 	modalOpen     bool
@@ -109,6 +113,8 @@ func (m *Model) ForceWidth(w int) {
 type PRBundle struct {
 	Meta           *pr.PRMeta
 	ReviewComments []ctxpane.CommentRef
+	IssueComments  []ctxpane.IssueCommentDisplay
+	Reviews        []ctxpane.ReviewDisplay
 }
 
 func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Model {
@@ -131,8 +137,22 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Mod
 	if pb != nil {
 		m.prMeta = pb.Meta
 		m.reviewComments = pb.ReviewComments
+		m.issueComments = pb.IssueComments
+		m.reviews = pb.Reviews
 	}
 	return m
+}
+
+// renderPRTabBody renders the [4 PR] tab body. For v1, no internal scrolling
+// (content fits in most terminals); add a viewport in a follow-up if needed.
+func (m Model) renderPRTabBody() string {
+	innerW := m.width - 4
+	if innerW < 20 {
+		innerW = 20
+	}
+	content := renderPRTabBody(m.prMeta, m.issueComments, m.reviews, len(m.drafts), m.reviewBody, innerW)
+	bodyH := m.height - headerRows - helpHeight - 2
+	return paneStyle.Width(m.width - 2).Height(bodyH).Render(content)
 }
 
 // editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
@@ -250,6 +270,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "3", "o":
 			m.setView(viewOverview)
+			return m, nil
+		case "4":
+			if m.prMeta == nil {
+				m.statusMsg = "4: only in PR mode"
+				return m, nil
+			}
+			m.setView(viewPR)
 			return m, nil
 		case "j", "down":
 			if m.view == viewOverview {
@@ -425,6 +452,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				side = "LEFT"
 			}
 			return m, m.composeDraft(fr.Path, line, side)
+		case "B":
+			if m.prMeta == nil {
+				return m, nil
+			}
+			return m, m.composeReviewBody()
 		case "t":
 			if m.prMeta == nil || m.view != viewChanges {
 				return m, nil
@@ -495,6 +527,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.drafts = append(m.drafts, msg.draft)
 		m.statusMsg = fmt.Sprintf("draft saved (%d total)", len(m.drafts))
 		return m, m.scheduleContextRefresh()
+
+	case reviewBodyComposedMsg:
+		if msg.err != nil {
+			m.statusMsg = "B: " + msg.err.Error()
+			return m, nil
+		}
+		m.reviewBody = msg.body
+		m.statusMsg = "review body saved"
+		return m, nil
 
 	case draftEditedMsg:
 		if msg.err != nil {
@@ -664,6 +705,45 @@ type draftEditedMsg struct {
 	err  error
 }
 
+// composeReviewBody opens $EDITOR with the current m.reviewBody as the
+// starting buffer; on save, the result replaces m.reviewBody.
+func (m *Model) composeReviewBody() tea.Cmd {
+	f, err := os.CreateTemp("", "gitreview-review-body-*.md")
+	if err != nil {
+		m.statusMsg = "B: " + err.Error()
+		return nil
+	}
+	if _, err := f.WriteString(m.reviewBody); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		m.statusMsg = "B: " + err.Error()
+		return nil
+	}
+	f.Close()
+	cmd := editorCmd(f.Name(), 1)
+	if cmd == nil {
+		m.statusMsg = "B: no editor found (set $EDITOR)"
+		os.Remove(f.Name())
+		return nil
+	}
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		defer os.Remove(f.Name())
+		if err != nil {
+			return reviewBodyComposedMsg{err: err}
+		}
+		raw, readErr := os.ReadFile(f.Name())
+		if readErr != nil {
+			return reviewBodyComposedMsg{err: readErr}
+		}
+		return reviewBodyComposedMsg{body: stripDraftComments(string(raw))}
+	})
+}
+
+type reviewBodyComposedMsg struct {
+	body string
+	err  error
+}
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a
@@ -748,9 +828,12 @@ func (m Model) View() string {
 	}
 	header := m.renderTopHeader()
 	var body string
-	if m.view == viewOverview {
+	switch m.view {
+	case viewOverview:
 		body = m.renderOverviewBody()
-	} else {
+	case viewPR:
+		body = m.renderPRTabBody()
+	default:
 		parts := []string{m.renderLeftPane(), m.renderDiffPane()}
 		if m.contextPaneWidthEffective() > 0 {
 			parts = append(parts, m.renderContextPane())
@@ -797,6 +880,9 @@ func (m Model) renderTabsGlobal() string {
 		style(m.view == viewChanges).Render("[1 changes]"),
 		style(m.view == viewCommits).Render("[2 commits]"),
 		style(m.view == viewOverview).Render("[3 overview]"),
+	}
+	if m.prMeta != nil {
+		parts = append(parts, style(m.view == viewPR).Render("[4 PR]"))
 	}
 	return strings.Join(parts, " ")
 }
@@ -1027,6 +1113,10 @@ func (m *Model) setView(v viewMode) {
 			m.statusMsg = "no files to overview"
 			return
 		}
+	}
+	if v == viewPR && m.prMeta == nil {
+		m.statusMsg = "no PR loaded"
+		return
 	}
 	if v == m.view {
 		return
