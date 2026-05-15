@@ -115,6 +115,8 @@ type composeKind int
 const (
 	composeNewDraft composeKind = iota
 	composeEditDraft
+	composeBody    // B: edit review body, no submit
+	composeSubmit  // S: edit review body + submit drafts on Ctrl+s
 )
 
 type modalAnchor struct {
@@ -249,9 +251,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				wasPath := m.composePath
 				wasLine := m.composeLine
 				wasSide := m.composeSide
+				kind := m.composeKind
 				m.composeOpen = false
 				m.composeFromMod = false
-				m.statusMsg = "compose: cancelled"
+				switch kind {
+				case composeSubmit:
+					m.statusMsg = "submit: cancelled"
+				case composeBody:
+					m.statusMsg = "body: cancelled"
+				default:
+					m.statusMsg = "compose: cancelled"
+				}
 				if wasFromMod {
 					entries := buildThread(m.reviewComments, m.drafts, wasPath, wasLine, wasSide)
 					if len(entries) > 0 {
@@ -264,16 +274,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "ctrl+s":
 				body := strings.TrimSpace(m.composeArea.Value())
+				kind := m.composeKind
 				m.composeOpen = false
+				if kind == composeSubmit {
+					// Submit fires the POST; drafts get cleared on success
+					// in the submitDoneMsg handler.
+					return m, m.doSubmit(body)
+				}
+				if kind == composeBody {
+					m.reviewBody = body
+					if body == "" {
+						m.statusMsg = "review body cleared"
+					} else {
+						m.statusMsg = "review body saved"
+					}
+					return m, nil
+				}
+				// Inline draft (new / edit).
 				if body == "" {
-					if m.composeKind == composeEditDraft && m.composeEditIdx >= 0 && m.composeEditIdx < len(m.drafts) {
+					if kind == composeEditDraft && m.composeEditIdx >= 0 && m.composeEditIdx < len(m.drafts) {
 						m.drafts = append(m.drafts[:m.composeEditIdx], m.drafts[m.composeEditIdx+1:]...)
 						m.statusMsg = "draft deleted (empty save)"
 					} else {
 						m.statusMsg = "compose: cancelled (empty)"
 					}
 				} else {
-					switch m.composeKind {
+					switch kind {
 					case composeNewDraft:
 						m.drafts = append(m.drafts, ctxpane.Draft{Path: m.composePath, Line: m.composeLine, Side: m.composeSide, Body: body})
 						m.statusMsg = fmt.Sprintf("draft saved (%d total)", len(m.drafts))
@@ -552,7 +578,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.prMeta == nil {
 				return m, nil
 			}
-			return m, m.composeReviewBody()
+			return m, m.openComposeBodyModal(composeBody)
 		case "S":
 			if m.prMeta == nil {
 				return m, nil
@@ -565,7 +591,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "S: no drafts to submit"
 				return m, nil
 			}
-			return m, m.composeAndSubmit()
+			return m, m.openComposeBodyModal(composeSubmit)
 		case "t":
 			if m.prMeta == nil || m.view != viewChanges {
 				return m, nil
@@ -622,15 +648,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMsg = "edit done — quit and re-run to refresh"
 		}
-		return m, nil
-
-	case reviewBodyComposedMsg:
-		if msg.err != nil {
-			m.statusMsg = "B: " + msg.err.Error()
-			return m, nil
-		}
-		m.reviewBody = msg.body
-		m.statusMsg = "review body saved"
 		return m, nil
 
 	case submitDoneMsg:
@@ -712,6 +729,31 @@ func openBrowser(url string) error {
 // composeDraft spawns $EDITOR on an empty temp file. On editor exit, the
 // file contents (after stripping #-comment lines + trimming) become the
 // draft body. Empty bodies are dropped without state change.
+// openComposeBodyModal shows the modal for composing the review body
+// (kind=composeBody) or composing-then-submitting (kind=composeSubmit).
+// The textarea seeds with whatever is currently in m.reviewBody.
+func (m *Model) openComposeBodyModal(kind composeKind) tea.Cmd {
+	ta := textarea.New()
+	if kind == composeSubmit {
+		ta.Placeholder = "Optional review summary…"
+	} else {
+		ta.Placeholder = "Your review summary…"
+	}
+	ta.CharLimit = 64 * 1024
+	ta.SetValue(m.reviewBody)
+	ta.ShowLineNumbers = false
+	cmd := ta.Focus()
+	m.composeArea = ta
+	m.composeOpen = true
+	m.composeKind = kind
+	m.composePath = ""
+	m.composeLine = 0
+	m.composeSide = ""
+	m.composeEditIdx = -1
+	m.composeFromMod = false
+	return cmd
+}
+
 // openComposeModal initialises and shows the in-TUI textarea for composing
 // or editing a single inline comment. When called from inside the thread
 // modal (editDraft path), composeFromMod is set so the thread modal
@@ -748,104 +790,22 @@ func stripDraftComments(s string) string {
 	return strings.TrimSpace(strings.Join(keep, "\n"))
 }
 
-// composeReviewBody opens $EDITOR with the current m.reviewBody as the
-// starting buffer; on save, the result replaces m.reviewBody.
-func (m *Model) composeReviewBody() tea.Cmd {
-	f, err := os.CreateTemp("", "gitreview-review-body-*.md")
-	if err != nil {
-		m.statusMsg = "B: " + err.Error()
-		return nil
-	}
-	if _, err := f.WriteString(m.reviewBody); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		m.statusMsg = "B: " + err.Error()
-		return nil
-	}
-	f.Close()
-	cmd := editorCmd(f.Name(), 1)
-	if cmd == nil {
-		m.statusMsg = "B: no editor found (set $EDITOR)"
-		os.Remove(f.Name())
-		return nil
-	}
-	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		defer os.Remove(f.Name())
-		if err != nil {
-			return reviewBodyComposedMsg{err: err}
-		}
-		raw, readErr := os.ReadFile(f.Name())
-		if readErr != nil {
-			return reviewBodyComposedMsg{err: readErr}
-		}
-		return reviewBodyComposedMsg{body: stripDraftComments(string(raw))}
-	})
-}
-
-type reviewBodyComposedMsg struct {
-	body string
-	err  error
-}
-
-// composeAndSubmit opens $EDITOR with the templated body, then POSTs via
-// the configured submitter. On success: clears drafts + reviewBody and
-// triggers a context-pane refresh. On failure: drafts kept, status shown.
-func (m *Model) composeAndSubmit() tea.Cmd {
-	tpl := "# Review body (optional — leave empty for no overall comment).\n# Lines starting with # are stripped.\n#\n"
-	tpl += fmt.Sprintf("# %d inline drafts:\n", len(m.drafts))
-	for _, d := range m.drafts {
-		tpl += fmt.Sprintf("#   %s:%d  %q\n", d.Path, d.Line, truncForTemplate(d.Body, 60))
-	}
-	if m.reviewBody != "" {
-		tpl += "\n" + m.reviewBody
-	}
-	f, err := os.CreateTemp("", "gitreview-submit-*.md")
-	if err != nil {
-		m.statusMsg = "S: " + err.Error()
-		return nil
-	}
-	if _, err := f.WriteString(tpl); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		m.statusMsg = "S: " + err.Error()
-		return nil
-	}
-	f.Close()
-	cmd := editorCmd(f.Name(), 1)
-	if cmd == nil {
-		m.statusMsg = "S: no editor found (set $EDITOR)"
-		os.Remove(f.Name())
-		return nil
-	}
+// doSubmit returns a Cmd that POSTs the review via the configured submitter.
+// Called from the compose-modal Ctrl+s handler when kind == composeSubmit.
+// Drafts are snapshotted up front so any later UI mutation can't race with
+// the in-flight POST.
+func (m *Model) doSubmit(body string) tea.Cmd {
 	draftsSnap := make([]pr.SubmitDraft, len(m.drafts))
 	for i, d := range m.drafts {
 		draftsSnap[i] = pr.SubmitDraft{Path: d.Path, Line: d.Line, Side: d.Side, Body: d.Body}
 	}
 	submitter := m.submitter
-	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		defer os.Remove(f.Name())
-		if err != nil {
-			return submitDoneMsg{err: err}
-		}
-		raw, readErr := os.ReadFile(f.Name())
-		if readErr != nil {
-			return submitDoneMsg{err: readErr}
-		}
-		body := stripDraftComments(string(raw))
+	return func() tea.Msg {
 		if err := submitter(context.Background(), body, draftsSnap); err != nil {
 			return submitDoneMsg{err: err}
 		}
 		return submitDoneMsg{n: len(draftsSnap)}
-	})
-}
-
-func truncForTemplate(s string, n int) string {
-	flat := strings.Join(strings.Fields(s), " ")
-	if len([]rune(flat)) <= n {
-		return flat
 	}
-	r := []rune(flat)
-	return string(r[:n-1]) + "…"
 }
 
 type submitDoneMsg struct {
@@ -979,33 +939,41 @@ func (m Model) View() string {
 	return view
 }
 
-// renderComposeOverlay draws the in-TUI compose modal: header with file/line,
-// context block with surrounding diff lines (cursor line marked), the
-// textarea itself, and a help line.
+// renderComposeOverlay draws the in-TUI compose modal. Layout adapts to
+// the composeKind: inline-comment modals show the diff context around the
+// anchor; review-body and submit modals show a header/draft summary.
 func (m Model) renderComposeOverlay() string {
 	modalW := minInt(m.width-4, 90)
-	innerW := modalW - 6 // border + padding
+	innerW := modalW - 6
 
 	var b strings.Builder
-	verb := "Comment"
-	if m.composeKind == composeEditDraft {
-		verb = "Edit"
-	}
-	fmt.Fprintf(&b, "%s\n\n", titleStyle.Render(fmt.Sprintf("%s on %s:%d (%s side)", verb, m.composePath, m.composeLine, m.composeSide)))
+	title, helpHint := composeModalChrome(m.composeKind, m.composePath, m.composeLine, m.composeSide, len(m.drafts))
+	fmt.Fprintf(&b, "%s\n\n", titleStyle.Render(title))
 
-	// Context block (uncommented — visual, not text-form #).
-	if fr, ok := m.fileByPath(m.composePath); ok {
-		ctx := composeContextBlock(fr, m.composeLine, m.composeSide, innerW)
-		if ctx != "" {
-			b.WriteString(ctx)
-			b.WriteString("\n\n")
+	// Context block depends on kind:
+	//   inline: diff lines around anchor
+	//   submit: draft summary
+	//   body:   short tagline
+	switch m.composeKind {
+	case composeNewDraft, composeEditDraft:
+		if fr, ok := m.fileByPath(m.composePath); ok {
+			ctx := composeContextBlock(fr, m.composeLine, m.composeSide, innerW)
+			if ctx != "" {
+				b.WriteString(ctx)
+				b.WriteString("\n\n")
+			}
 		}
+	case composeSubmit:
+		b.WriteString(submitDraftsSummary(m.drafts, innerW))
+		b.WriteString("\n\n")
+	case composeBody:
+		b.WriteString(mutedStyle.Render("This text accompanies your drafts when you press S."))
+		b.WriteString("\n\n")
 	}
 
 	// Size the textarea: take up remaining vertical room, capped.
 	taH := 8
 	if m.height > 0 {
-		// Leave room for: title (2 lines), context (~7), help (1), borders (3).
 		avail := m.height - 16
 		if avail > taH {
 			taH = minInt(avail, 18)
@@ -1015,11 +983,47 @@ func (m Model) renderComposeOverlay() string {
 	m.composeArea.SetHeight(taH)
 	b.WriteString(m.composeArea.View())
 	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render(" Ctrl+s save · Esc cancel"))
+	b.WriteString(mutedStyle.Render(helpHint))
 
 	modal := modalStyle.Width(modalW).Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
 		lipgloss.WithWhitespaceChars(" "))
+}
+
+// composeModalChrome returns the title + help-line hint for each kind.
+func composeModalChrome(kind composeKind, path string, line int, side string, draftCount int) (title, help string) {
+	switch kind {
+	case composeNewDraft:
+		return fmt.Sprintf("Comment on %s:%d (%s side)", path, line, side),
+			" Ctrl+s save · Esc cancel"
+	case composeEditDraft:
+		return fmt.Sprintf("Edit on %s:%d (%s side)", path, line, side),
+			" Ctrl+s save · Esc cancel · empty save = delete"
+	case composeBody:
+		return "Review body", " Ctrl+s save · Esc cancel"
+	case composeSubmit:
+		return fmt.Sprintf("Submit review (%d inline %s)", draftCount, plural("comment", draftCount)),
+			" Ctrl+s submit · Esc cancel"
+	}
+	return "Compose", " Ctrl+s save · Esc cancel"
+}
+
+// submitDraftsSummary renders the bullet list of pending drafts shown above
+// the textarea in the submit modal.
+func submitDraftsSummary(drafts []ctxpane.Draft, width int) string {
+	var b strings.Builder
+	b.WriteString(mutedStyle.Render(fmt.Sprintf("%d %s will be posted:", len(drafts), plural("draft", len(drafts)))))
+	b.WriteString("\n")
+	for _, d := range drafts {
+		snippet := strings.Join(strings.Fields(d.Body), " ")
+		row := fmt.Sprintf("  %s:%d  %q", d.Path, d.Line, snippet)
+		if len(row) > width {
+			row = row[:width-1] + "…"
+		}
+		b.WriteString(mutedStyle.Render(row))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // fileByPath returns the diff.File matching path, scanning the current diff.
