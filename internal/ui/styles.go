@@ -94,4 +94,10 @@ var (
 	contextItemSelectedStyle = lipgloss.NewStyle().
 					Background(colCursor).
 					Foreground(lipgloss.Color("15"))
+
+	// prHeaderStyle is the "PR #N · author · state" strip in the top header
+	// when running in PR mode.
+	prHeaderStyle = lipgloss.NewStyle().
+			Foreground(colBorderFocus).
+			Bold(true)
 )

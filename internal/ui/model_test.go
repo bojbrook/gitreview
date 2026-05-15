@@ -6,6 +6,7 @@ import (
 
 	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
+	"github.com/bowenbrooks/gitreview/internal/pr"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -38,7 +39,7 @@ func fakeDiff() *diff.Diff {
 }
 
 func TestModelRenders(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -58,7 +59,7 @@ func TestModelRenders(t *testing.T) {
 }
 
 func TestModelNavigation(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -87,7 +88,7 @@ func TestModelNavigation(t *testing.T) {
 }
 
 func TestCurrentFileRow(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -105,7 +106,7 @@ func TestCurrentFileRow(t *testing.T) {
 }
 
 func TestContextPaneVisibleByDefault(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	if !m.contextPaneVisible {
@@ -131,7 +132,7 @@ func TestContextPaneVisibleByDefault(t *testing.T) {
 }
 
 func TestContextPaneHiddenBelow120Cols(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	if m.contextPaneWidthEffective() != 0 {
@@ -140,7 +141,7 @@ func TestContextPaneHiddenBelow120Cols(t *testing.T) {
 }
 
 func TestContextPaneToggleWithC(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	if !m.contextPaneVisible {
@@ -161,7 +162,7 @@ func TestContextPaneToggleWithC(t *testing.T) {
 }
 
 func TestContextPaneHiddenInSplitView(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
@@ -172,7 +173,7 @@ func TestContextPaneHiddenInSplitView(t *testing.T) {
 }
 
 func TestContextRefreshStaleCancel(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 
@@ -198,7 +199,7 @@ func TestContextRefreshStaleCancel(t *testing.T) {
 }
 
 func TestContextHistoryToggleWithH(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	if m.contextHistoryExpanded {
@@ -215,7 +216,7 @@ func TestContextHistoryToggleWithH(t *testing.T) {
 }
 
 func TestContextHistoryHIgnoredWithoutPaneFocus(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	// focus is paneLeft — H should be ignored.
@@ -227,7 +228,7 @@ func TestContextHistoryHIgnoredWithoutPaneFocus(t *testing.T) {
 }
 
 func TestContextFocusCycle(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	if m.focus != paneLeft {
@@ -251,7 +252,7 @@ func TestContextFocusCycle(t *testing.T) {
 }
 
 func TestContextFocusSkipsHiddenPane(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30}) // < 120: pane hidden
 	m = updated.(Model)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -267,7 +268,7 @@ func TestContextFocusSkipsHiddenPane(t *testing.T) {
 }
 
 func TestContextEscReturnsFocusToDiff(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -285,7 +286,7 @@ func TestContextEscReturnsFocusToDiff(t *testing.T) {
 }
 
 func TestRefreshDiffBuildsTree(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = updated.(Model)
 	if len(m.treeRows) == 0 {
@@ -298,7 +299,7 @@ func TestRefreshDiffBuildsTree(t *testing.T) {
 }
 
 func TestExpandCollapseEnter(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -322,7 +323,7 @@ func TestExpandCollapseEnter(t *testing.T) {
 }
 
 func TestLExpandsThenDescends(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -346,7 +347,7 @@ func TestLExpandsThenDescends(t *testing.T) {
 }
 
 func TestHJumpsToParent(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -360,7 +361,7 @@ func TestHJumpsToParent(t *testing.T) {
 }
 
 func TestMarkReviewedNoOpOnDirRow(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -376,7 +377,7 @@ func TestMarkReviewedNoOpOnDirRow(t *testing.T) {
 }
 
 func TestMarkReviewedTogglesOnFileRow(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -389,7 +390,7 @@ func TestMarkReviewedTogglesOnFileRow(t *testing.T) {
 }
 
 func TestNextUnreviewedWalksFileRowsOnly(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -404,7 +405,7 @@ func TestNextUnreviewedWalksFileRowsOnly(t *testing.T) {
 }
 
 func TestFilterPreservesCollapsedAfterClear(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -432,7 +433,7 @@ func TestFilterPreservesCollapsedAfterClear(t *testing.T) {
 }
 
 func TestFilterPathPreFilterRestores(t *testing.T) {
-	m := New(fakeDiff(), nil, "")
+	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -456,5 +457,30 @@ func TestFilterPathPreFilterRestores(t *testing.T) {
 	m.clearFilter()
 	if f, _, ok := m.currentFileRow(); !ok || f.Path != "main.go" {
 		t.Errorf("after clear: cursor should restore to main.go, got ok=%v f=%+v", ok, f)
+	}
+}
+
+func TestPRModeHeader(t *testing.T) {
+	meta := &pr.PRMeta{
+		Number:  42,
+		Owner:   "foo",
+		Repo:    "bar",
+		Title:   "Add caching",
+		Author:  "alice",
+		State:   "open",
+		HTMLURL: "https://github.com/foo/bar/pull/42",
+	}
+	m := New(fakeDiff(), nil, "", meta)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
+	m = updated.(Model)
+	out := m.View()
+	if !strings.Contains(out, "PR #42") {
+		t.Errorf("View missing PR strip: %s", out)
+	}
+	if !strings.Contains(out, "alice") {
+		t.Errorf("View missing author: %s", out)
+	}
+	if !strings.Contains(out, "O: open in browser") {
+		t.Errorf("View missing browser hint: %s", out)
 	}
 }
