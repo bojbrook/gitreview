@@ -37,6 +37,7 @@ const (
 	viewCommits
 	viewOverview
 	viewPR
+	viewComments
 )
 
 type Model struct {
@@ -92,7 +93,7 @@ type Model struct {
 	issueComments  []ctxpane.IssueCommentDisplay
 	reviews        []ctxpane.ReviewDisplay
 	reviewBody     string // composed via B; consumed by S
-	submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft, event string) error
 	refetcher      func(ctx context.Context) (*RefetcherResult, error)
 
 	// Thread modal state.
@@ -101,6 +102,15 @@ type Model struct {
 	modalSelected int
 	modalAnchor   modalAnchor
 
+	// [5 comments] tab state. commentsCursor indexes into the unified comment
+	// list rebuilt on each render; commentsDetailFocused flips with tab so
+	// long detail bodies could be scrolled (no scrolling yet — flag reserved).
+	// addressedThreads is a local-only ✓ mark on inline threads — like
+	// reviewedFiles but per-anchor, not persisted to GitHub or disk.
+	commentsCursor        int
+	commentsDetailFocused bool
+	addressedThreads      map[threadKey]bool
+
 	// Compose modal state — in-TUI textarea for C / e (inline drafts).
 	composeOpen    bool
 	composeArea    textarea.Model
@@ -108,8 +118,9 @@ type Model struct {
 	composePath    string
 	composeLine    int
 	composeSide    string
-	composeEditIdx int  // valid only when composeKind == composeEditDraft
-	composeFromMod bool // true when modal opened from thread modal (re-open on save)
+	composeEditIdx int    // valid only when composeKind == composeEditDraft
+	composeFromMod bool   // true when modal opened from thread modal (re-open on save)
+	composeVerdict string // pr.EventComment | EventApprove | EventRequestChanges; only used by composeSubmit
 }
 
 type composeKind int
@@ -139,7 +150,7 @@ type PRBundle struct {
 	ReviewComments []ctxpane.CommentRef
 	IssueComments  []ctxpane.IssueCommentDisplay
 	Reviews        []ctxpane.ReviewDisplay
-	Submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	Submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft, event string) error
 	// Refetcher re-pulls the three comment streams from GitHub. Called after
 	// successful submit so just-posted comments appear without re-launch.
 	Refetcher func(ctx context.Context) (*RefetcherResult, error)
@@ -169,6 +180,7 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Mod
 		reviewedFiles:      map[string]bool{},
 		contextPaneVisible: true,
 		treeCollapsed:      map[string]bool{},
+		addressedThreads:   map[threadKey]bool{},
 	}
 	if pb != nil {
 		m.prMeta = pb.Meta
@@ -191,6 +203,75 @@ func (m Model) renderPRTabBody() string {
 	content := renderPRTabBody(m.prMeta, m.issueComments, m.reviews, len(m.drafts), m.reviewBody, innerW)
 	bodyH := m.height - headerRows - helpHeight - 2
 	return paneStyle.Width(m.width - 2).Height(bodyH).Render(content)
+}
+
+// renderCommentsBody renders the [5 comments] tab — a two-pane list + detail
+// view of every PR comment plus the user's local drafts.
+func (m Model) renderCommentsBody() string {
+	items := m.commentsItems()
+	var files []diff.File
+	if m.d != nil {
+		files = m.d.Files
+	}
+	bodyH := m.height - headerRows - helpHeight
+	return renderCommentsTab(items, m.commentsCursor, files, m.width, bodyH, !m.commentsDetailFocused, m.addressedThreads)
+}
+
+// commentsItems returns the merged + chronologically-sorted comment list for
+// the [5 comments] tab. Rebuilt on demand so it always reflects current drafts.
+func (m Model) commentsItems() []unifiedComment {
+	return unifyComments(m.reviewComments, m.issueComments, m.reviews, m.drafts)
+}
+
+func (m *Model) moveCommentsCursor(delta int) {
+	n := len(m.commentsItems())
+	if n == 0 {
+		m.commentsCursor = 0
+		return
+	}
+	c := m.commentsCursor + delta
+	if c < 0 {
+		c = 0
+	}
+	if c > n-1 {
+		c = n - 1
+	}
+	m.commentsCursor = c
+}
+
+// commentsJump handles enter on the comments tab: for inline / draft rows,
+// switch to viewChanges and position the file/line cursor on the anchor.
+// No-op for review and issue-comment rows (they have no anchor).
+func (m *Model) commentsJump() tea.Cmd {
+	items := m.commentsItems()
+	if m.commentsCursor < 0 || m.commentsCursor >= len(items) {
+		return nil
+	}
+	c := items[m.commentsCursor]
+	if c.Path == "" || c.Line == 0 {
+		m.statusMsg = "no anchor on this comment"
+		return nil
+	}
+	m.view = viewChanges
+	m.refreshDiff() // rebuild treeRows
+	if row := RowOfFile(m.treeRows, c.Path); row >= 0 {
+		m.rowCursor = row
+	} else {
+		m.statusMsg = fmt.Sprintf("file %s not in current diff", c.Path)
+		return m.scheduleContextRefresh()
+	}
+	m.refreshDiff() // re-render diff for the new rowCursor and populate diffRows
+	// Position the per-line cursor on the anchor, if present in the diff rows.
+	for i, r := range m.diffRows {
+		if r.IsLine && r.Path == c.Path && r.Line == c.Line && r.Side == c.Side {
+			m.diffCursor = i
+			m.ensureCursorVisible()
+			m.rerenderDiffCursor()
+			break
+		}
+	}
+	m.focus = paneDiff
+	return m.scheduleContextRefresh()
 }
 
 // editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
@@ -324,6 +405,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.composeFromMod = false
 				return m, m.scheduleContextRefresh()
 			}
+			// Verdict picker: Ctrl+r cycles comment → approve → request-changes.
+			// Ctrl+t was the first pick but macOS's terminal driver maps it to
+			// VSTATUS (SIGINFO) and on some setups bubbletea's raw-mode setup
+			// doesn't fully suppress that, so the byte never reaches the app.
+			// Ctrl+r has no driver semantics and isn't bound by bubbles' textarea.
+			if m.composeKind == composeSubmit && msg.String() == "ctrl+r" {
+				switch m.composeVerdict {
+				case pr.EventComment:
+					m.composeVerdict = pr.EventApprove
+				case pr.EventApprove:
+					m.composeVerdict = pr.EventRequestChanges
+				default:
+					m.composeVerdict = pr.EventComment
+				}
+				m.statusMsg = "verdict: " + strings.ToLower(strings.ReplaceAll(m.composeVerdict, "_", "-"))
+				return m, nil
+			}
 			var cmd tea.Cmd
 			m.composeArea, cmd = m.composeArea.Update(msg)
 			return m, cmd
@@ -378,9 +476,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
+			if m.view == viewComments {
+				m.commentsDetailFocused = !m.commentsDetailFocused
+				return m, nil
+			}
 			m.focus = m.nextFocus(+1)
 			return m, nil
 		case "shift+tab":
+			if m.view == viewComments {
+				m.commentsDetailFocused = !m.commentsDetailFocused
+				return m, nil
+			}
 			m.focus = m.nextFocus(-1)
 			return m, nil
 		case "v":
@@ -402,7 +508,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.setView(viewPR)
 			return m, nil
+		case "5":
+			if m.prMeta == nil {
+				m.statusMsg = "5: only in PR mode"
+				return m, nil
+			}
+			m.setView(viewComments)
+			return m, nil
+		case "a":
+			if m.view != viewComments {
+				return m, nil
+			}
+			items := m.commentsItems()
+			if m.commentsCursor < 0 || m.commentsCursor >= len(items) {
+				return m, nil
+			}
+			c := items[m.commentsCursor]
+			if c.Kind != commentThread {
+				m.statusMsg = "a: can only mark threads addressed"
+				return m, nil
+			}
+			k := threadKey{Path: c.Path, Line: c.Line, Side: c.Side}
+			if m.addressedThreads[k] {
+				delete(m.addressedThreads, k)
+				m.statusMsg = fmt.Sprintf("unmarked %s:%d", c.Path, c.Line)
+			} else {
+				m.addressedThreads[k] = true
+				m.statusMsg = fmt.Sprintf("marked %s:%d addressed", c.Path, c.Line)
+			}
+			return m, nil
 		case "j", "down":
+			if m.view == viewComments {
+				m.moveCommentsCursor(+1)
+				return m, nil
+			}
 			if m.view == viewOverview {
 				m.moveOverview(0, +1)
 				return m, m.scheduleContextRefresh()
@@ -428,6 +567,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.ScrollDown(1)
 			return m, m.maybeScheduleHunkChange()
 		case "k", "up":
+			if m.view == viewComments {
+				m.moveCommentsCursor(-1)
+				return m, nil
+			}
 			if m.view == viewOverview {
 				m.moveOverview(0, -1)
 				return m, m.scheduleContextRefresh()
@@ -493,6 +636,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "enter":
+			if m.view == viewComments {
+				return m, m.commentsJump()
+			}
 			if m.view == viewOverview {
 				files, _ := m.effectiveFiles()
 				if m.overviewCursor >= 0 && m.overviewCursor < len(files) {
@@ -580,6 +726,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "C":
 			if m.prMeta == nil {
 				return m, nil
+			}
+			if m.view == viewComments {
+				items := m.commentsItems()
+				if m.commentsCursor < 0 || m.commentsCursor >= len(items) {
+					return m, nil
+				}
+				c := items[m.commentsCursor]
+				if c.Kind != commentThread {
+					m.statusMsg = "C: can only reply to inline threads"
+					return m, nil
+				}
+				return m, m.openComposeModal(composeNewDraft, c.Path, c.Line, c.Side, -1, "")
 			}
 			if m.view != viewChanges {
 				m.statusMsg = "C: switch to changes view first"
@@ -785,6 +943,11 @@ func (m *Model) openComposeBodyModal(kind composeKind) tea.Cmd {
 	m.composeSide = ""
 	m.composeEditIdx = -1
 	m.composeFromMod = false
+	if kind == composeSubmit {
+		// Reset to "comment" on each open so a previous session's verdict
+		// doesn't silently carry over.
+		m.composeVerdict = pr.EventComment
+	}
 	return cmd
 }
 
@@ -834,8 +997,12 @@ func (m *Model) doSubmit(body string) tea.Cmd {
 		draftsSnap[i] = pr.SubmitDraft{Path: d.Path, Line: d.Line, Side: d.Side, Body: d.Body}
 	}
 	submitter := m.submitter
+	verdict := m.composeVerdict
+	if verdict == "" {
+		verdict = pr.EventComment
+	}
 	return func() tea.Msg {
-		if err := submitter(context.Background(), body, draftsSnap); err != nil {
+		if err := submitter(context.Background(), body, draftsSnap, verdict); err != nil {
 			return submitDoneMsg{err: err}
 		}
 		return submitDoneMsg{n: len(draftsSnap)}
@@ -1043,6 +1210,8 @@ func (m Model) View() string {
 		body = m.renderOverviewBody()
 	case viewPR:
 		body = m.renderPRTabBody()
+	case viewComments:
+		body = m.renderCommentsBody()
 	default:
 		parts := []string{m.renderLeftPane(), m.renderDiffPane()}
 		if m.contextPaneWidthEffective() > 0 {
@@ -1090,6 +1259,8 @@ func (m Model) renderComposeOverlay() string {
 			}
 		}
 	case composeSubmit:
+		b.WriteString(renderVerdictPicker(m.composeVerdict, innerW))
+		b.WriteString("\n\n")
 		b.WriteString(submitDraftsSummary(m.drafts, innerW))
 		b.WriteString("\n\n")
 	case composeBody:
@@ -1129,9 +1300,24 @@ func composeModalChrome(kind composeKind, path string, line int, side string, dr
 		return "Review body", " Ctrl+s save · Esc cancel"
 	case composeSubmit:
 		return fmt.Sprintf("Submit review (%d inline %s)", draftCount, plural("comment", draftCount)),
-			" Ctrl+s submit · Esc cancel"
+			" Ctrl+s submit · Ctrl+r cycle verdict · Esc cancel"
 	}
 	return "Compose", " Ctrl+s save · Esc cancel"
+}
+
+// renderVerdictPicker is the radio-style row at the top of the submit modal
+// showing which review event (verdict) Ctrl+s will post.
+func renderVerdictPicker(verdict string, width int) string {
+	mark := func(v string) string {
+		if verdict == v {
+			return "(•) "
+		}
+		return "( ) "
+	}
+	row := fmt.Sprintf("verdict: %scomment  %sapprove  %srequest-changes",
+		mark(pr.EventComment), mark(pr.EventApprove), mark(pr.EventRequestChanges))
+	_ = width // intentional: line is short enough to not need wrapping
+	return titleStyle.Render(row)
 }
 
 // submitDraftsSummary renders the bullet list of pending drafts shown above
@@ -1265,7 +1451,10 @@ func (m Model) renderTabsGlobal() string {
 		style(m.view == viewOverview).Render("[3 overview]"),
 	}
 	if m.prMeta != nil {
-		parts = append(parts, style(m.view == viewPR).Render("[4 PR]"))
+		parts = append(parts,
+			style(m.view == viewPR).Render("[4 PR]"),
+			style(m.view == viewComments).Render("[5 comments]"),
+		)
 	}
 	return strings.Join(parts, " ")
 }
@@ -1509,6 +1698,10 @@ func (m *Model) setView(v viewMode) {
 		}
 	}
 	if v == viewPR && m.prMeta == nil {
+		m.statusMsg = "no PR loaded"
+		return
+	}
+	if v == viewComments && m.prMeta == nil {
 		m.statusMsg = "no PR loaded"
 		return
 	}
@@ -2286,7 +2479,11 @@ func (m Model) renderHelp() string {
 	if m.splitView {
 		splitHint = "s: unified"
 	}
-	parts := []string{"j/k file", "]/[ hunk", "m mark", "M next-unreviewed", "/ filter", "1/2/3 tab", splitHint, "e edit", "q quit"}
+	tabHint := "1/2/3 tab"
+	if m.prMeta != nil {
+		tabHint = "1/2/3/4/5 tab"
+	}
+	parts := []string{"j/k file", "]/[ hunk", "m mark", "M next-unreviewed", "/ filter", tabHint, splitHint, "e edit", "q quit"}
 	if m.filter != "" {
 		parts = append([]string{"c clear-filter"}, parts...)
 	} else {
@@ -2294,6 +2491,9 @@ func (m Model) renderHelp() string {
 	}
 	if m.prMeta != nil {
 		parts = append(parts, "C: comment", "S: submit", "t: thread", "B: body", "O: browser")
+	}
+	if m.view == viewComments {
+		parts = []string{"j/k select", "enter jump", "C reply", "a addressed", "r refresh", "tab focus", "1/2/3/4/5 tab", "q quit"}
 	}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {

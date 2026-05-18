@@ -92,39 +92,14 @@ func runPRMode(args []string) {
 		}
 	}()
 
-	refs := make([]ctxpane.CommentRef, 0, len(bundle.ReviewComments))
-	for _, c := range bundle.ReviewComments {
-		refs = append(refs, ctxpane.CommentRef{
-			User: c.User,
-			Path: c.Path,
-			Line: c.Line,
-			Side: c.Side,
-			Body: c.Body,
-			Age:  humanRelative(c.CreatedAt),
-		})
-	}
-	ics := make([]ctxpane.IssueCommentDisplay, 0, len(bundle.IssueComments))
-	for _, c := range bundle.IssueComments {
-		ics = append(ics, ctxpane.IssueCommentDisplay{
-			User: c.User,
-			Age:  humanRelative(c.CreatedAt),
-			Body: c.Body,
-		})
-	}
-	rvs := make([]ctxpane.ReviewDisplay, 0, len(bundle.Reviews))
-	for _, r := range bundle.Reviews {
-		rvs = append(rvs, ctxpane.ReviewDisplay{
-			User:  r.User,
-			State: r.State,
-			Age:   humanRelative(r.SubmittedAt),
-			Body:  r.Body,
-		})
-	}
+	refs := mapCommentRefs(bundle.ReviewComments)
+	ics := mapIssueComments(bundle.IssueComments)
+	rvs := mapReviews(bundle.Reviews)
 	submitToken, tokenErr := pr.ResolveToken(ctx)
 	if tokenErr != nil {
 		fmt.Fprintln(os.Stderr, "gitreview: warn: submit disabled (auth):", tokenErr)
 	}
-	var submitter func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	var submitter func(ctx context.Context, body string, drafts []pr.SubmitDraft, event string) error
 	var refetcher func(ctx context.Context) (*ui.RefetcherResult, error)
 	if submitToken != "" {
 		if s, sErr := pr.NewSubmitter(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number); sErr != nil {
@@ -214,12 +189,13 @@ func mapCommentRefs(in []pr.ReviewComment) []ctxpane.CommentRef {
 	out := make([]ctxpane.CommentRef, 0, len(in))
 	for _, c := range in {
 		out = append(out, ctxpane.CommentRef{
-			User: c.User,
-			Path: c.Path,
-			Line: c.Line,
-			Side: c.Side,
-			Body: c.Body,
-			Age:  humanRelative(c.CreatedAt),
+			User:      c.User,
+			Path:      c.Path,
+			Line:      c.Line,
+			Side:      c.Side,
+			Body:      c.Body,
+			Age:       humanRelative(c.CreatedAt),
+			CreatedAt: unixOrZero(c.CreatedAt),
 		})
 	}
 	return out
@@ -229,9 +205,10 @@ func mapIssueComments(in []pr.IssueComment) []ctxpane.IssueCommentDisplay {
 	out := make([]ctxpane.IssueCommentDisplay, 0, len(in))
 	for _, c := range in {
 		out = append(out, ctxpane.IssueCommentDisplay{
-			User: c.User,
-			Age:  humanRelative(c.CreatedAt),
-			Body: c.Body,
+			User:      c.User,
+			Age:       humanRelative(c.CreatedAt),
+			Body:      c.Body,
+			CreatedAt: unixOrZero(c.CreatedAt),
 		})
 	}
 	return out
@@ -241,11 +218,19 @@ func mapReviews(in []pr.Review) []ctxpane.ReviewDisplay {
 	out := make([]ctxpane.ReviewDisplay, 0, len(in))
 	for _, r := range in {
 		out = append(out, ctxpane.ReviewDisplay{
-			User:  r.User,
-			State: r.State,
-			Age:   humanRelative(r.SubmittedAt),
-			Body:  r.Body,
+			User:      r.User,
+			State:     r.State,
+			Age:       humanRelative(r.SubmittedAt),
+			Body:      r.Body,
+			CreatedAt: unixOrZero(r.SubmittedAt),
 		})
 	}
 	return out
+}
+
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }
