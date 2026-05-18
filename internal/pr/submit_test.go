@@ -30,7 +30,7 @@ func TestSubmit_HappyPath(t *testing.T) {
 	}
 	err = Submit(context.Background(), c, "foo", "bar", 89, "overall LGTM", []SubmitDraft{
 		{Path: "src/a.go", Line: 12, Side: "RIGHT", Body: "nit"},
-	})
+	}, EventComment)
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -58,9 +58,32 @@ func TestSubmit_HappyPath(t *testing.T) {
 }
 
 func TestSubmit_RejectsEmptyAndNoBody(t *testing.T) {
-	err := Submit(context.Background(), nil, "foo", "bar", 89, "", nil)
+	err := Submit(context.Background(), nil, "foo", "bar", 89, "", nil, EventComment)
 	if err == nil {
 		t.Error("Submit with no drafts and no body should error")
+	}
+}
+
+func TestSubmit_AllowsEmptyApprove(t *testing.T) {
+	var captured map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/foo/bar/pulls/89/reviews", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &captured)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c, err := newClient("t", srv.URL+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Submit(context.Background(), c, "foo", "bar", 89, "", nil, EventApprove); err != nil {
+		t.Fatalf("approve with no drafts should succeed: %v", err)
+	}
+	if captured["event"] != "APPROVE" {
+		t.Errorf("event: got %v want APPROVE", captured["event"])
 	}
 }
 
@@ -77,7 +100,7 @@ func TestSubmit_PostError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = Submit(context.Background(), c, "foo", "bar", 89, "", []SubmitDraft{{Path: "a", Line: 1, Side: "RIGHT", Body: "x"}})
+	err = Submit(context.Background(), c, "foo", "bar", 89, "", []SubmitDraft{{Path: "a", Line: 1, Side: "RIGHT", Body: "x"}}, EventComment)
 	if err == nil {
 		t.Fatal("want error on 403")
 	}

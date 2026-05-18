@@ -17,13 +17,26 @@ type SubmitDraft struct {
 	Body string
 }
 
-// Submit POSTs a single review to GitHub with state=COMMENT, the optional
-// overall body, and all drafts as inline comments. Returns nil on success.
-// On HTTP failure, the returned error includes GitHub's response status so
-// 403 (missing scope) is self-explanatory.
-func Submit(ctx context.Context, c *github.Client, owner, repo string, num int, body string, drafts []SubmitDraft) error {
-	if len(drafts) == 0 && body == "" {
+// Valid review events accepted by Submit. Empty / unknown coerces to
+// EventComment (GitHub's "leave a comment review" mode).
+const (
+	EventComment        = "COMMENT"
+	EventApprove        = "APPROVE"
+	EventRequestChanges = "REQUEST_CHANGES"
+)
+
+// Submit POSTs a single review to GitHub with the given event (verdict),
+// the optional overall body, and all drafts as inline comments. Returns nil
+// on success. On HTTP failure, the returned error includes GitHub's response
+// status so 403 (missing scope) is self-explanatory.
+func Submit(ctx context.Context, c *github.Client, owner, repo string, num int, body string, drafts []SubmitDraft, event string) error {
+	if len(drafts) == 0 && body == "" && event != EventApprove {
 		return fmt.Errorf("submit: nothing to send (no drafts, empty body)")
+	}
+	switch event {
+	case EventApprove, EventRequestChanges, EventComment:
+	default:
+		event = EventComment
 	}
 	mapped := make([]*github.DraftReviewComment, 0, len(drafts))
 	for _, d := range drafts {
@@ -37,7 +50,7 @@ func Submit(ctx context.Context, c *github.Client, owner, repo string, num int, 
 		})
 	}
 	req := &github.PullRequestReviewRequest{
-		Event:    github.String("COMMENT"),
+		Event:    github.String(event),
 		Comments: mapped,
 	}
 	if body != "" {
@@ -55,14 +68,15 @@ func Submit(ctx context.Context, c *github.Client, owner, repo string, num int, 
 
 // NewSubmitter returns a closure that POSTs a review to (owner, repo, num)
 // using a fresh client built from token. Callers should resolve the token
-// once and call this once per session.
-func NewSubmitter(token, owner, repo string, num int) (func(ctx context.Context, body string, drafts []SubmitDraft) error, error) {
+// once and call this once per session. event is one of EventComment /
+// EventApprove / EventRequestChanges; unknown values coerce to EventComment.
+func NewSubmitter(token, owner, repo string, num int) (func(ctx context.Context, body string, drafts []SubmitDraft, event string) error, error) {
 	c, err := newClient(token, "")
 	if err != nil {
 		return nil, err
 	}
-	return func(ctx context.Context, body string, drafts []SubmitDraft) error {
-		return Submit(ctx, c, owner, repo, num, body, drafts)
+	return func(ctx context.Context, body string, drafts []SubmitDraft, event string) error {
+		return Submit(ctx, c, owner, repo, num, body, drafts, event)
 	}, nil
 }
 

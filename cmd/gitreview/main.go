@@ -99,7 +99,7 @@ func runPRMode(args []string) {
 	if tokenErr != nil {
 		fmt.Fprintln(os.Stderr, "gitreview: warn: submit disabled (auth):", tokenErr)
 	}
-	var submitter func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	var submitter func(ctx context.Context, body string, drafts []pr.SubmitDraft, event string) error
 	var refetcher func(ctx context.Context) (*ui.RefetcherResult, error)
 	if submitToken != "" {
 		if s, sErr := pr.NewSubmitter(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number); sErr != nil {

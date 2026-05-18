@@ -93,7 +93,7 @@ type Model struct {
 	issueComments  []ctxpane.IssueCommentDisplay
 	reviews        []ctxpane.ReviewDisplay
 	reviewBody     string // composed via B; consumed by S
-	submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft, event string) error
 	refetcher      func(ctx context.Context) (*RefetcherResult, error)
 
 	// Thread modal state.
@@ -105,8 +105,11 @@ type Model struct {
 	// [5 comments] tab state. commentsCursor indexes into the unified comment
 	// list rebuilt on each render; commentsDetailFocused flips with tab so
 	// long detail bodies could be scrolled (no scrolling yet — flag reserved).
+	// addressedThreads is a local-only ✓ mark on inline threads — like
+	// reviewedFiles but per-anchor, not persisted to GitHub or disk.
 	commentsCursor        int
 	commentsDetailFocused bool
+	addressedThreads      map[threadKey]bool
 
 	// Compose modal state — in-TUI textarea for C / e (inline drafts).
 	composeOpen    bool
@@ -115,8 +118,9 @@ type Model struct {
 	composePath    string
 	composeLine    int
 	composeSide    string
-	composeEditIdx int  // valid only when composeKind == composeEditDraft
-	composeFromMod bool // true when modal opened from thread modal (re-open on save)
+	composeEditIdx int    // valid only when composeKind == composeEditDraft
+	composeFromMod bool   // true when modal opened from thread modal (re-open on save)
+	composeVerdict string // pr.EventComment | EventApprove | EventRequestChanges; only used by composeSubmit
 }
 
 type composeKind int
@@ -146,7 +150,7 @@ type PRBundle struct {
 	ReviewComments []ctxpane.CommentRef
 	IssueComments  []ctxpane.IssueCommentDisplay
 	Reviews        []ctxpane.ReviewDisplay
-	Submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	Submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft, event string) error
 	// Refetcher re-pulls the three comment streams from GitHub. Called after
 	// successful submit so just-posted comments appear without re-launch.
 	Refetcher func(ctx context.Context) (*RefetcherResult, error)
@@ -176,6 +180,7 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Mod
 		reviewedFiles:      map[string]bool{},
 		contextPaneVisible: true,
 		treeCollapsed:      map[string]bool{},
+		addressedThreads:   map[threadKey]bool{},
 	}
 	if pb != nil {
 		m.prMeta = pb.Meta
@@ -209,7 +214,7 @@ func (m Model) renderCommentsBody() string {
 		files = m.d.Files
 	}
 	bodyH := m.height - headerRows - helpHeight
-	return renderCommentsTab(items, m.commentsCursor, files, m.width, bodyH, !m.commentsDetailFocused)
+	return renderCommentsTab(items, m.commentsCursor, files, m.width, bodyH, !m.commentsDetailFocused, m.addressedThreads)
 }
 
 // commentsItems returns the merged + chronologically-sorted comment list for
@@ -400,6 +405,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.composeFromMod = false
 				return m, m.scheduleContextRefresh()
 			}
+			// Verdict picker keys, only in the submit modal. Alt-prefixed to
+			// avoid colliding with textarea bindings.
+			if m.composeKind == composeSubmit {
+				switch msg.String() {
+				case "alt+a":
+					m.composeVerdict = pr.EventApprove
+					return m, nil
+				case "alt+r":
+					m.composeVerdict = pr.EventRequestChanges
+					return m, nil
+				case "alt+c":
+					m.composeVerdict = pr.EventComment
+					return m, nil
+				}
+			}
 			var cmd tea.Cmd
 			m.composeArea, cmd = m.composeArea.Update(msg)
 			return m, cmd
@@ -492,6 +512,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.setView(viewComments)
+			return m, nil
+		case "a":
+			if m.view != viewComments {
+				return m, nil
+			}
+			items := m.commentsItems()
+			if m.commentsCursor < 0 || m.commentsCursor >= len(items) {
+				return m, nil
+			}
+			c := items[m.commentsCursor]
+			if c.Kind != commentThread {
+				m.statusMsg = "a: can only mark threads addressed"
+				return m, nil
+			}
+			k := threadKey{Path: c.Path, Line: c.Line, Side: c.Side}
+			if m.addressedThreads[k] {
+				delete(m.addressedThreads, k)
+				m.statusMsg = fmt.Sprintf("unmarked %s:%d", c.Path, c.Line)
+			} else {
+				m.addressedThreads[k] = true
+				m.statusMsg = fmt.Sprintf("marked %s:%d addressed", c.Path, c.Line)
+			}
 			return m, nil
 		case "j", "down":
 			if m.view == viewComments {
@@ -682,6 +724,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "C":
 			if m.prMeta == nil {
 				return m, nil
+			}
+			if m.view == viewComments {
+				items := m.commentsItems()
+				if m.commentsCursor < 0 || m.commentsCursor >= len(items) {
+					return m, nil
+				}
+				c := items[m.commentsCursor]
+				if c.Kind != commentThread {
+					m.statusMsg = "C: can only reply to inline threads"
+					return m, nil
+				}
+				return m, m.openComposeModal(composeNewDraft, c.Path, c.Line, c.Side, -1, "")
 			}
 			if m.view != viewChanges {
 				m.statusMsg = "C: switch to changes view first"
@@ -887,6 +941,11 @@ func (m *Model) openComposeBodyModal(kind composeKind) tea.Cmd {
 	m.composeSide = ""
 	m.composeEditIdx = -1
 	m.composeFromMod = false
+	if kind == composeSubmit {
+		// Reset to "comment" on each open so a previous session's verdict
+		// doesn't silently carry over.
+		m.composeVerdict = pr.EventComment
+	}
 	return cmd
 }
 
@@ -936,8 +995,12 @@ func (m *Model) doSubmit(body string) tea.Cmd {
 		draftsSnap[i] = pr.SubmitDraft{Path: d.Path, Line: d.Line, Side: d.Side, Body: d.Body}
 	}
 	submitter := m.submitter
+	verdict := m.composeVerdict
+	if verdict == "" {
+		verdict = pr.EventComment
+	}
 	return func() tea.Msg {
-		if err := submitter(context.Background(), body, draftsSnap); err != nil {
+		if err := submitter(context.Background(), body, draftsSnap, verdict); err != nil {
 			return submitDoneMsg{err: err}
 		}
 		return submitDoneMsg{n: len(draftsSnap)}
@@ -1194,6 +1257,8 @@ func (m Model) renderComposeOverlay() string {
 			}
 		}
 	case composeSubmit:
+		b.WriteString(renderVerdictPicker(m.composeVerdict, innerW))
+		b.WriteString("\n\n")
 		b.WriteString(submitDraftsSummary(m.drafts, innerW))
 		b.WriteString("\n\n")
 	case composeBody:
@@ -1233,9 +1298,24 @@ func composeModalChrome(kind composeKind, path string, line int, side string, dr
 		return "Review body", " Ctrl+s save · Esc cancel"
 	case composeSubmit:
 		return fmt.Sprintf("Submit review (%d inline %s)", draftCount, plural("comment", draftCount)),
-			" Ctrl+s submit · Esc cancel"
+			" Ctrl+s submit · Esc cancel · Alt+a approve · Alt+r request-changes · Alt+c comment"
 	}
 	return "Compose", " Ctrl+s save · Esc cancel"
+}
+
+// renderVerdictPicker is the radio-style row at the top of the submit modal
+// showing which review event (verdict) Ctrl+s will post.
+func renderVerdictPicker(verdict string, width int) string {
+	mark := func(v string) string {
+		if verdict == v {
+			return "(•) "
+		}
+		return "( ) "
+	}
+	row := fmt.Sprintf("verdict: %scomment  %sapprove  %srequest-changes",
+		mark(pr.EventComment), mark(pr.EventApprove), mark(pr.EventRequestChanges))
+	_ = width // intentional: line is short enough to not need wrapping
+	return titleStyle.Render(row)
 }
 
 // submitDraftsSummary renders the bullet list of pending drafts shown above
@@ -2411,7 +2491,7 @@ func (m Model) renderHelp() string {
 		parts = append(parts, "C: comment", "S: submit", "t: thread", "B: body", "O: browser")
 	}
 	if m.view == viewComments {
-		parts = []string{"j/k select", "enter jump", "tab focus", "1/2/3/4/5 tab", "q quit"}
+		parts = []string{"j/k select", "enter jump", "C reply", "a addressed", "r refresh", "tab focus", "1/2/3/4/5 tab", "q quit"}
 	}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {

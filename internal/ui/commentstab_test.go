@@ -118,7 +118,7 @@ func TestCommentListHeaderKinds(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := commentListHeader(tt.c, 60)
+			got := commentListHeader(tt.c, 60, false)
 			for _, want := range tt.contains {
 				if !strings.Contains(got, want) {
 					t.Errorf("header %q missing %q", got, want)
@@ -165,6 +165,81 @@ func TestCommentsTabRenders(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("comments view missing %q. Got:\n%s", want, out)
 		}
+	}
+}
+
+func TestCommentsReplyOpensComposeOnThread(t *testing.T) {
+	m := New(fakeDiff(), nil, "", &PRBundle{
+		Meta: &pr.PRMeta{Number: 1, Author: "x", State: "open", Title: "t"},
+		ReviewComments: []ctxpane.CommentRef{
+			{User: "bob", Path: "main.go", Line: 2, Side: "RIGHT", Body: "non-nil?", Age: "1h", CreatedAt: 200},
+		},
+	})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
+	m = updated.(Model)
+	if !m.composeOpen {
+		t.Fatal("expected compose modal open after C on thread")
+	}
+	if m.composePath != "main.go" || m.composeLine != 2 || m.composeSide != "RIGHT" {
+		t.Errorf("compose anchor wrong: path=%q line=%d side=%q", m.composePath, m.composeLine, m.composeSide)
+	}
+	if m.composeKind != composeNewDraft {
+		t.Errorf("expected composeNewDraft kind, got %d", m.composeKind)
+	}
+}
+
+func TestCommentsReplyNoopOnReview(t *testing.T) {
+	m := New(fakeDiff(), nil, "", &PRBundle{
+		Meta: &pr.PRMeta{Number: 1, Author: "x", State: "open", Title: "t"},
+		Reviews: []ctxpane.ReviewDisplay{
+			{User: "alice", State: "APPROVED", Age: "1h", Body: "LGTM", CreatedAt: 100},
+		},
+	})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
+	m = updated.(Model)
+	if m.composeOpen {
+		t.Error("C on a review row should not open compose modal")
+	}
+	if m.statusMsg == "" {
+		t.Error("expected a status message explaining C is for threads only")
+	}
+}
+
+func TestCommentsAddressedToggle(t *testing.T) {
+	m := New(fakeDiff(), nil, "", &PRBundle{
+		Meta: &pr.PRMeta{Number: 1, Author: "x", State: "open", Title: "t"},
+		ReviewComments: []ctxpane.CommentRef{
+			{User: "bob", Path: "main.go", Line: 2, Side: "RIGHT", Body: "non-nil?", Age: "1h", CreatedAt: 200},
+		},
+	})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	k := threadKey{Path: "main.go", Line: 2, Side: "RIGHT"}
+	if !m.addressedThreads[k] {
+		t.Fatal("expected thread to be marked addressed after first 'a'")
+	}
+	out := m.View()
+	if !strings.Contains(out, "✓") {
+		t.Errorf("expected ✓ in rendered list. Got:\n%s", out)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+	if m.addressedThreads[k] {
+		t.Error("expected mark to clear on second 'a'")
 	}
 }
 

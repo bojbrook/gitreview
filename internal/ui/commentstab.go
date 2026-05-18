@@ -176,14 +176,15 @@ func unifyComments(
 
 // renderCommentsTab returns the rendered body of the [5 comments] tab.
 // Two panes: anchor-grouped list on the left, full thread on the right.
-func renderCommentsTab(items []unifiedComment, selected int, files []diff.File, width, height int, listFocused bool) string {
+// addressed contains thread anchors the user has marked addressed (✓ prefix).
+func renderCommentsTab(items []unifiedComment, selected int, files []diff.File, width, height int, listFocused bool, addressed map[threadKey]bool) string {
 	if len(items) == 0 {
 		return paneStyle.Width(width - 2).Height(height - 2).Render(mutedStyle.Render("(no comments)"))
 	}
 	listW := commentListWidth(width)
 	detailW := width - listW
 	sel := clamp(selected, 0, len(items)-1)
-	list := renderCommentList(items, sel, listW, height, listFocused)
+	list := renderCommentList(items, sel, listW, height, listFocused, addressed)
 	detail := renderCommentDetail(items[sel], files, detailW, height, !listFocused)
 	return lipgloss.JoinHorizontal(lipgloss.Top, list, detail)
 }
@@ -207,15 +208,16 @@ func commentListWidth(totalW int) int {
 	return w
 }
 
-func renderCommentList(items []unifiedComment, selected, paneW, bodyH int, focused bool) string {
+func renderCommentList(items []unifiedComment, selected, paneW, bodyH int, focused bool, addressed map[threadKey]bool) string {
 	innerW := paneW - 4
 	if innerW < 8 {
 		innerW = 8
 	}
 	var b strings.Builder
 	for i, c := range items {
-		header := commentListHeader(c, innerW)
-		snippet := commentListSnippet(c, innerW)
+		isAddressed := c.Kind == commentThread && addressed[threadKey{Path: c.Path, Line: c.Line, Side: c.Side}]
+		header := commentListHeader(c, innerW, isAddressed)
+		snippet := commentListSnippet(c, innerW, isAddressed)
 		if i == selected {
 			header = cursorStyle.Render(padPlainToWidth(ansi.Strip(header), innerW))
 			snippet = cursorStyle.Render(padPlainToWidth(ansi.Strip(snippet), innerW))
@@ -237,7 +239,8 @@ func renderCommentList(items []unifiedComment, selected, paneW, bodyH int, focus
 
 // commentListHeader renders the first line of a list row. Reviews/issues
 // lead with the author; threads lead with the anchor + reply count.
-func commentListHeader(c unifiedComment, innerW int) string {
+// addressed adds a ✓ prefix and dims the whole row.
+func commentListHeader(c unifiedComment, innerW int, addressed bool) string {
 	var left, right string
 	switch c.Kind {
 	case commentReview:
@@ -262,6 +265,9 @@ func commentListHeader(c unifiedComment, innerW int) string {
 			left = prDraftStyle.Render("[DRAFT] ") + left
 		}
 	}
+	if addressed {
+		left = "✓ " + left
+	}
 	lw := ansi.StringWidth(left)
 	rw := ansi.StringWidth(right)
 	if lw+rw+1 > innerW {
@@ -272,12 +278,19 @@ func commentListHeader(c unifiedComment, innerW int) string {
 	if gap < 1 {
 		gap = 1
 	}
-	return left + strings.Repeat(" ", gap) + mutedStyle.Render(right)
+	row := left + strings.Repeat(" ", gap) + mutedStyle.Render(right)
+	if addressed {
+		row = mutedStyle.Render(ansi.Strip(row))
+	}
+	return row
 }
 
 // commentListSnippet renders the second line of a list row: a single-line
 // preview of the comment (review/issue) or of the latest reply (thread).
-func commentListSnippet(c unifiedComment, innerW int) string {
+// addressed is currently ignored — the ✓ on the header line is enough signal;
+// dimming the snippet too made the row hard to read against the cursor bar.
+func commentListSnippet(c unifiedComment, innerW int, addressed bool) string {
+	_ = addressed
 	prefix := "> "
 	if c.Kind == commentThread {
 		prefix = "  " + c.Author + ": "
