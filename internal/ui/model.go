@@ -405,20 +405,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.composeFromMod = false
 				return m, m.scheduleContextRefresh()
 			}
-			// Verdict picker keys, only in the submit modal. Alt-prefixed to
-			// avoid colliding with textarea bindings.
-			if m.composeKind == composeSubmit {
-				switch msg.String() {
-				case "alt+a":
+			// Verdict picker: Ctrl+t cycles comment → approve → request-changes.
+			// Single key (works on Mac terminals where Alt is rarely Meta);
+			// Bubbles' textarea doesn't bind Ctrl+t so the intercept is clean.
+			if m.composeKind == composeSubmit && msg.String() == "ctrl+t" {
+				switch m.composeVerdict {
+				case pr.EventComment:
 					m.composeVerdict = pr.EventApprove
-					return m, nil
-				case "alt+r":
+				case pr.EventApprove:
 					m.composeVerdict = pr.EventRequestChanges
-					return m, nil
-				case "alt+c":
+				default:
 					m.composeVerdict = pr.EventComment
-					return m, nil
 				}
+				return m, nil
 			}
 			var cmd tea.Cmd
 			m.composeArea, cmd = m.composeArea.Update(msg)
@@ -1298,7 +1297,7 @@ func composeModalChrome(kind composeKind, path string, line int, side string, dr
 		return "Review body", " Ctrl+s save · Esc cancel"
 	case composeSubmit:
 		return fmt.Sprintf("Submit review (%d inline %s)", draftCount, plural("comment", draftCount)),
-			" Ctrl+s submit · Esc cancel · Alt+a approve · Alt+r request-changes · Alt+c comment"
+			" Ctrl+s submit · Ctrl+t cycle verdict · Esc cancel"
 	}
 	return "Compose", " Ctrl+s save · Esc cancel"
 }

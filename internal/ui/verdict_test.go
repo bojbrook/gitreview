@@ -54,7 +54,7 @@ func TestVerdictDefaultIsComment(t *testing.T) {
 	}
 }
 
-func TestVerdictAltKeysCycle(t *testing.T) {
+func TestVerdictCtrlTCycles(t *testing.T) {
 	submitter, captured := captureSubmitter()
 	m := New(fakeDiff(), nil, "", &PRBundle{
 		Meta:      &pr.PRMeta{Number: 1, Author: "x", State: "open", Title: "t"},
@@ -66,27 +66,27 @@ func TestVerdictAltKeysCycle(t *testing.T) {
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
 	m = updated.(Model)
 
-	// Alt+a → APPROVE
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}, Alt: true})
+	// Cycle: comment → approve
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
 	m = updated.(Model)
 	if m.composeVerdict != pr.EventApprove {
-		t.Errorf("after Alt+a: got %q want APPROVE", m.composeVerdict)
+		t.Errorf("after first Ctrl+t: got %q want APPROVE", m.composeVerdict)
 	}
-	// Alt+r → REQUEST_CHANGES
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}, Alt: true})
+	// approve → request-changes
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
 	m = updated.(Model)
 	if m.composeVerdict != pr.EventRequestChanges {
-		t.Errorf("after Alt+r: got %q want REQUEST_CHANGES", m.composeVerdict)
+		t.Errorf("after second Ctrl+t: got %q want REQUEST_CHANGES", m.composeVerdict)
 	}
-	// Alt+c → COMMENT
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}, Alt: true})
+	// request-changes → comment
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
 	m = updated.(Model)
 	if m.composeVerdict != pr.EventComment {
-		t.Errorf("after Alt+c: got %q want COMMENT", m.composeVerdict)
+		t.Errorf("after third Ctrl+t: got %q want COMMENT", m.composeVerdict)
 	}
 
-	// Set back to APPROVE and submit; verify submitter received it.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}, Alt: true})
+	// Cycle once more (to APPROVE) and submit; verify submitter received it.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
 	m = updated.(Model)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	m = updated.(Model)
