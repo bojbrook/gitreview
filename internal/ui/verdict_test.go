@@ -54,7 +54,7 @@ func TestVerdictDefaultIsComment(t *testing.T) {
 	}
 }
 
-func TestVerdictCtrlTCycles(t *testing.T) {
+func TestVerdictCtrlRCycles(t *testing.T) {
 	submitter, captured := captureSubmitter()
 	m := New(fakeDiff(), nil, "", &PRBundle{
 		Meta:      &pr.PRMeta{Number: 1, Author: "x", State: "open", Title: "t"},
@@ -67,26 +67,26 @@ func TestVerdictCtrlTCycles(t *testing.T) {
 	m = updated.(Model)
 
 	// Cycle: comment → approve
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
 	m = updated.(Model)
 	if m.composeVerdict != pr.EventApprove {
-		t.Errorf("after first Ctrl+t: got %q want APPROVE", m.composeVerdict)
+		t.Errorf("after first Ctrl+r: got %q want APPROVE", m.composeVerdict)
 	}
 	// approve → request-changes
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
 	m = updated.(Model)
 	if m.composeVerdict != pr.EventRequestChanges {
-		t.Errorf("after second Ctrl+t: got %q want REQUEST_CHANGES", m.composeVerdict)
+		t.Errorf("after second Ctrl+r: got %q want REQUEST_CHANGES", m.composeVerdict)
 	}
 	// request-changes → comment
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
 	m = updated.(Model)
 	if m.composeVerdict != pr.EventComment {
-		t.Errorf("after third Ctrl+t: got %q want COMMENT", m.composeVerdict)
+		t.Errorf("after third Ctrl+r: got %q want COMMENT", m.composeVerdict)
 	}
 
 	// Cycle once more (to APPROVE) and submit; verify submitter received it.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
 	m = updated.(Model)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	m = updated.(Model)

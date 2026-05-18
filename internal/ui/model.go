@@ -405,10 +405,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.composeFromMod = false
 				return m, m.scheduleContextRefresh()
 			}
-			// Verdict picker: Ctrl+t cycles comment → approve → request-changes.
-			// Single key (works on Mac terminals where Alt is rarely Meta);
-			// Bubbles' textarea doesn't bind Ctrl+t so the intercept is clean.
-			if m.composeKind == composeSubmit && msg.String() == "ctrl+t" {
+			// Verdict picker: Ctrl+r cycles comment → approve → request-changes.
+			// Ctrl+t was the first pick but macOS's terminal driver maps it to
+			// VSTATUS (SIGINFO) and on some setups bubbletea's raw-mode setup
+			// doesn't fully suppress that, so the byte never reaches the app.
+			// Ctrl+r has no driver semantics and isn't bound by bubbles' textarea.
+			if m.composeKind == composeSubmit && msg.String() == "ctrl+r" {
 				switch m.composeVerdict {
 				case pr.EventComment:
 					m.composeVerdict = pr.EventApprove
@@ -417,6 +419,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				default:
 					m.composeVerdict = pr.EventComment
 				}
+				m.statusMsg = "verdict: " + strings.ToLower(strings.ReplaceAll(m.composeVerdict, "_", "-"))
 				return m, nil
 			}
 			var cmd tea.Cmd
@@ -1297,7 +1300,7 @@ func composeModalChrome(kind composeKind, path string, line int, side string, dr
 		return "Review body", " Ctrl+s save · Esc cancel"
 	case composeSubmit:
 		return fmt.Sprintf("Submit review (%d inline %s)", draftCount, plural("comment", draftCount)),
-			" Ctrl+s submit · Ctrl+t cycle verdict · Esc cancel"
+			" Ctrl+s submit · Ctrl+r cycle verdict · Esc cancel"
 	}
 	return "Compose", " Ctrl+s save · Esc cancel"
 }
