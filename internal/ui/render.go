@@ -24,7 +24,7 @@ func renderFullDiff(files []diff.File, width int) string {
 		header := fmt.Sprintf("── %s %s ──", f.Status, f.Path)
 		b.WriteString(titleStyle.Render(truncate(header, width)))
 		b.WriteString("\n")
-		b.WriteString(renderDiff(f, width))
+		b.WriteString(renderDiff(f, width, diffRenderOpts{CursorRow: -1}))
 		b.WriteString("\n")
 	}
 	return b.String()
@@ -373,29 +373,102 @@ func hunkOffsetsSplit(f diff.File) []int {
 	return out
 }
 
-// renderDiff produces a styled unified-diff string for a file.
-func renderDiff(f diff.File, width int) string {
+// diffLineKey identifies a unique anchor in a diff for comment lookup.
+type diffLineKey struct {
+	Path string
+	Line int
+	Side string // "RIGHT" | "LEFT"
+}
+
+// diffRenderOpts controls cursor highlight + commented-line markers in the
+// unified diff renderer. Default-zero values mean "no highlight, no markers".
+type diffRenderOpts struct {
+	CursorRow int                  // 0-based viewport-row index; -1 = no highlight
+	Commented map[diffLineKey]bool // line keys with at least one comment or draft
+}
+
+// diffRow describes one viewport row's role in the rendered diff. Returned
+// alongside the rendered string so the model can drive a per-line cursor.
+type diffRow struct {
+	IsLine  bool // false = hunk header / spacer
+	HunkIdx int  // hunk index (0-based); -1 for spacer rows
+	Path    string
+	Line    int    // NEW-side line for adds/context; OLD-side for removes
+	Side    string // "RIGHT" | "LEFT"
+}
+
+// buildDiffRows walks the file's hunks and returns the row metadata the
+// renderer will produce. The slice length matches the rendered viewport's
+// line count exactly (1:1 row index ↔ slice index).
+func buildDiffRows(f diff.File) []diffRow {
+	var rows []diffRow
+	for hi, h := range f.Hunks {
+		if hi > 0 {
+			rows = append(rows, diffRow{HunkIdx: -1})
+		}
+		rows = append(rows, diffRow{HunkIdx: hi})
+		for _, l := range h.Lines {
+			r := diffRow{IsLine: true, HunkIdx: hi, Path: f.Path}
+			switch l.Kind {
+			case diff.LineRemoved:
+				r.Line = l.OldNum
+				r.Side = "LEFT"
+			default:
+				r.Line = l.NewNum
+				r.Side = "RIGHT"
+			}
+			rows = append(rows, r)
+		}
+	}
+	return rows
+}
+
+// renderDiff produces a styled unified-diff string for a file. When opts has
+// a non-negative CursorRow, that row is re-rendered with cursorStyle for a
+// full-width highlight. When opts.Commented[key] is true, the matching line
+// gets a gutter marker.
+func renderDiff(f diff.File, width int, opts diffRenderOpts) string {
 	if len(f.Hunks) == 0 {
 		return mutedStyle.Render("(no hunks)")
 	}
 
 	var b strings.Builder
+	rowIdx := 0
+	emit := func(s string) {
+		if rowIdx == opts.CursorRow {
+			s = cursorRowOverlay(s, width)
+		}
+		b.WriteString(s)
+		b.WriteString("\n")
+		rowIdx++
+	}
+
 	for hi, h := range f.Hunks {
 		if hi > 0 {
-			b.WriteString("\n")
+			emit("")
 		}
-		b.WriteString(mutedStyle.Render(truncate(h.Header, width)))
-		b.WriteString("\n")
+		emit(mutedStyle.Render(truncate(h.Header, width)))
 
 		for _, line := range h.Lines {
-			b.WriteString(renderLine(line, f.Language, width))
-			b.WriteString("\n")
+			emit(renderLine(line, f.Path, f.Language, width, opts.Commented))
 		}
 	}
 	return b.String()
 }
 
-func renderLine(l diff.Line, lang string, width int) string {
+// cursorRowOverlay re-renders the row with cursorStyle background, padded
+// to full width. Plain-text only; sacrifices syntax highlight on that one
+// row in exchange for a clearly visible cursor bar.
+func cursorRowOverlay(rendered string, width int) string {
+	plain := ansi.Strip(rendered)
+	w := ansi.StringWidth(plain)
+	if w < width {
+		plain += strings.Repeat(" ", width-w)
+	}
+	return cursorStyle.Render(plain)
+}
+
+func renderLine(l diff.Line, path, lang string, width int, commented map[diffLineKey]bool) string {
 	old := pad(l.OldNum)
 	new := pad(l.NewNum)
 	content := expandTabs(l.Content, 4)
@@ -418,7 +491,28 @@ func renderLine(l diff.Line, lang string, width int) string {
 
 	accent := lineAccent(l.Kind)
 	gutter := gutterStyle.Render(fmt.Sprintf("%s %s ", old, new))
-	return truncate(accent+gutter+sign+body, width)
+	marker := commentMarker(l, path, commented)
+	return truncate(accent+gutter+marker+sign+body, width)
+}
+
+// commentMarker returns a one-cell gutter glyph indicating that the line has
+// at least one inline review comment or draft. Always returns 1 visible cell
+// (space when no comment), so the rest of the row's columns stay aligned.
+func commentMarker(l diff.Line, path string, commented map[diffLineKey]bool) string {
+	if len(commented) == 0 {
+		return " "
+	}
+	var key diffLineKey
+	switch l.Kind {
+	case diff.LineRemoved:
+		key = diffLineKey{Path: path, Line: l.OldNum, Side: "LEFT"}
+	default:
+		key = diffLineKey{Path: path, Line: l.NewNum, Side: "RIGHT"}
+	}
+	if commented[key] {
+		return commentMarkerStyle.Render("●")
+	}
+	return " "
 }
 
 // lineAccent returns a 1-col vertical bar tinted by line kind. Green for adds,
@@ -449,7 +543,7 @@ func renderSplit(f diff.File, width int) string {
 	}
 	colW := (width - 3) / 2 // 3 for " │ " separator
 	if colW < 16 {
-		return renderDiff(f, width)
+		return renderDiff(f, width, diffRenderOpts{CursorRow: -1})
 	}
 
 	var b strings.Builder

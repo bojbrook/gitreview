@@ -13,6 +13,7 @@ import (
 	"github.com/bowenbrooks/gitreview/internal/ctxpane"
 	"github.com/bowenbrooks/gitreview/internal/diff"
 	"github.com/bowenbrooks/gitreview/internal/pr"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -35,6 +36,7 @@ const (
 	viewChanges viewMode = iota
 	viewCommits
 	viewOverview
+	viewPR
 )
 
 type Model struct {
@@ -53,10 +55,12 @@ type Model struct {
 	contextPaneVisible     bool // user-toggled; default true
 	contextPayload         ctxpane.Payload
 	contextCursor          ctxpane.Cursor
-	contextSelected        int   // currently highlighted item index when pane is focused
-	contextRefreshSeq      int   // monotonic; used to ignore stale debounced ticks
-	contextHistoryExpanded bool  // toggled by H when pane is focused
-	hunkOffsets            []int // viewport line indices of each hunk in the current file
+	contextSelected        int       // currently highlighted item index when pane is focused
+	contextRefreshSeq      int       // monotonic; used to ignore stale debounced ticks
+	contextHistoryExpanded bool      // toggled by H when pane is focused
+	hunkOffsets            []int     // viewport line indices of each hunk in the current file
+	diffRows               []diffRow // row metadata for the current file (unified view)
+	diffCursor             int       // index into diffRows; always points at a line row in viewChanges
 	width                  int
 	height                 int
 	forcedWidth            int
@@ -81,6 +85,46 @@ type Model struct {
 	reviewedFiles map[string]bool
 
 	prMeta *pr.PRMeta // non-nil when running in PR mode
+
+	// PR comment state — non-empty only in PR mode.
+	reviewComments []ctxpane.CommentRef // fetched, mapped from pr.ReviewComment
+	drafts         []ctxpane.Draft      // in-memory; cleared on submit
+	issueComments  []ctxpane.IssueCommentDisplay
+	reviews        []ctxpane.ReviewDisplay
+	reviewBody     string // composed via B; consumed by S
+	submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	refetcher      func(ctx context.Context) (*RefetcherResult, error)
+
+	// Thread modal state.
+	modalOpen     bool
+	modalEntries  []threadEntry
+	modalSelected int
+	modalAnchor   modalAnchor
+
+	// Compose modal state — in-TUI textarea for C / e (inline drafts).
+	composeOpen    bool
+	composeArea    textarea.Model
+	composeKind    composeKind
+	composePath    string
+	composeLine    int
+	composeSide    string
+	composeEditIdx int  // valid only when composeKind == composeEditDraft
+	composeFromMod bool // true when modal opened from thread modal (re-open on save)
+}
+
+type composeKind int
+
+const (
+	composeNewDraft composeKind = iota
+	composeEditDraft
+	composeBody   // B: edit review body, no submit
+	composeSubmit // S: edit review body + submit drafts on Ctrl+s
+)
+
+type modalAnchor struct {
+	Path string
+	Line int
+	Side string
 }
 
 // ForceWidth overrides the terminal width bubbletea reports. Useful when
@@ -89,12 +133,32 @@ func (m *Model) ForceWidth(w int) {
 	m.forcedWidth = w
 }
 
-func New(d *diff.Diff, commits []diff.Commit, repoRoot string, prMeta *pr.PRMeta) Model {
+// PRBundle is the optional PR data ui.New accepts. nil in pre-flight mode.
+type PRBundle struct {
+	Meta           *pr.PRMeta
+	ReviewComments []ctxpane.CommentRef
+	IssueComments  []ctxpane.IssueCommentDisplay
+	Reviews        []ctxpane.ReviewDisplay
+	Submitter      func(ctx context.Context, body string, drafts []pr.SubmitDraft) error
+	// Refetcher re-pulls the three comment streams from GitHub. Called after
+	// successful submit so just-posted comments appear without re-launch.
+	Refetcher func(ctx context.Context) (*RefetcherResult, error)
+}
+
+// RefetcherResult is what the Refetcher closure returns: the three comment
+// streams already mapped into UI-domain display types.
+type RefetcherResult struct {
+	ReviewComments []ctxpane.CommentRef
+	IssueComments  []ctxpane.IssueCommentDisplay
+	Reviews        []ctxpane.ReviewDisplay
+}
+
+func New(d *diff.Diff, commits []diff.Commit, repoRoot string, pb *PRBundle) Model {
 	ti := textinput.New()
 	ti.Prompt = "/"
 	ti.Placeholder = "filter files…"
 	ti.CharLimit = 100
-	return Model{
+	m := Model{
 		d:                  d,
 		commits:            commits,
 		commitDiff:         map[string]*diff.Diff{},
@@ -105,8 +169,28 @@ func New(d *diff.Diff, commits []diff.Commit, repoRoot string, prMeta *pr.PRMeta
 		reviewedFiles:      map[string]bool{},
 		contextPaneVisible: true,
 		treeCollapsed:      map[string]bool{},
-		prMeta:             prMeta,
 	}
+	if pb != nil {
+		m.prMeta = pb.Meta
+		m.reviewComments = pb.ReviewComments
+		m.issueComments = pb.IssueComments
+		m.reviews = pb.Reviews
+		m.submitter = pb.Submitter
+		m.refetcher = pb.Refetcher
+	}
+	return m
+}
+
+// renderPRTabBody renders the [4 PR] tab body. For v1, no internal scrolling
+// (content fits in most terminals); add a viewport in a follow-up if needed.
+func (m Model) renderPRTabBody() string {
+	innerW := m.width - 4
+	if innerW < 20 {
+		innerW = 20
+	}
+	content := renderPRTabBody(m.prMeta, m.issueComments, m.reviews, len(m.drafts), m.reviewBody, innerW)
+	bodyH := m.height - headerRows - helpHeight - 2
+	return paneStyle.Width(m.width - 2).Height(bodyH).Render(content)
 }
 
 // editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
@@ -160,6 +244,136 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.filtering {
 			return m.handleFilterKey(msg)
 		}
+		// Compose modal traps all keys when open. Esc cancels; Ctrl+s saves.
+		// Everything else routes to the textarea.
+		if m.composeOpen {
+			switch msg.String() {
+			case "esc":
+				wasFromMod := m.composeFromMod
+				wasPath := m.composePath
+				wasLine := m.composeLine
+				wasSide := m.composeSide
+				kind := m.composeKind
+				m.composeOpen = false
+				m.composeFromMod = false
+				switch kind {
+				case composeSubmit:
+					m.statusMsg = "submit: cancelled"
+				case composeBody:
+					m.statusMsg = "body: cancelled"
+				default:
+					m.statusMsg = "compose: cancelled"
+				}
+				if wasFromMod {
+					entries := buildThread(m.reviewComments, m.drafts, wasPath, wasLine, wasSide)
+					if len(entries) > 0 {
+						m.modalOpen = true
+						m.modalEntries = entries
+						m.modalSelected = 0
+						m.modalAnchor = modalAnchor{Path: wasPath, Line: wasLine, Side: wasSide}
+					}
+				}
+				return m, nil
+			case "ctrl+s":
+				body := strings.TrimSpace(m.composeArea.Value())
+				kind := m.composeKind
+				m.composeOpen = false
+				if kind == composeSubmit {
+					// Submit fires the POST; drafts get cleared on success
+					// in the submitDoneMsg handler.
+					return m, m.doSubmit(body)
+				}
+				if kind == composeBody {
+					m.reviewBody = body
+					if body == "" {
+						m.statusMsg = "review body cleared"
+					} else {
+						m.statusMsg = "review body saved"
+					}
+					return m, nil
+				}
+				// Inline draft (new / edit).
+				if body == "" {
+					if kind == composeEditDraft && m.composeEditIdx >= 0 && m.composeEditIdx < len(m.drafts) {
+						m.drafts = append(m.drafts[:m.composeEditIdx], m.drafts[m.composeEditIdx+1:]...)
+						m.statusMsg = "draft deleted (empty save)"
+					} else {
+						m.statusMsg = "compose: cancelled (empty)"
+					}
+				} else {
+					switch kind {
+					case composeNewDraft:
+						m.drafts = append(m.drafts, ctxpane.Draft{Path: m.composePath, Line: m.composeLine, Side: m.composeSide, Body: body})
+						m.statusMsg = fmt.Sprintf("draft saved (%d total)", len(m.drafts))
+					case composeEditDraft:
+						if m.composeEditIdx >= 0 && m.composeEditIdx < len(m.drafts) {
+							m.drafts[m.composeEditIdx].Body = body
+							m.statusMsg = "draft updated"
+						}
+					}
+				}
+				if m.composeFromMod {
+					entries := buildThread(m.reviewComments, m.drafts, m.composePath, m.composeLine, m.composeSide)
+					if len(entries) > 0 {
+						m.modalOpen = true
+						m.modalEntries = entries
+						m.modalSelected = 0
+						m.modalAnchor = modalAnchor{Path: m.composePath, Line: m.composeLine, Side: m.composeSide}
+					}
+				}
+				m.composeFromMod = false
+				return m, m.scheduleContextRefresh()
+			}
+			var cmd tea.Cmd
+			m.composeArea, cmd = m.composeArea.Update(msg)
+			return m, cmd
+		}
+		// Modal traps all keys when open.
+		if m.modalOpen {
+			switch msg.String() {
+			case "esc":
+				m.modalOpen = false
+				return m, nil
+			case "j", "down":
+				if m.modalSelected+1 < len(m.modalEntries) {
+					m.modalSelected++
+				}
+				return m, nil
+			case "k", "up":
+				if m.modalSelected > 0 {
+					m.modalSelected--
+				}
+				return m, nil
+			case "x":
+				if m.modalSelected >= 0 && m.modalSelected < len(m.modalEntries) {
+					e := m.modalEntries[m.modalSelected]
+					if e.IsDraft && e.DraftIdx >= 0 && e.DraftIdx < len(m.drafts) {
+						m.drafts = append(m.drafts[:e.DraftIdx], m.drafts[e.DraftIdx+1:]...)
+						m.modalEntries = buildThread(m.reviewComments, m.drafts, m.modalAnchor.Path, m.modalAnchor.Line, m.modalAnchor.Side)
+						if m.modalSelected >= len(m.modalEntries) {
+							m.modalSelected = maxInt(0, len(m.modalEntries)-1)
+						}
+						if len(m.modalEntries) == 0 {
+							m.modalOpen = false
+						}
+						return m, m.scheduleContextRefresh()
+					}
+				}
+				return m, nil
+			case "e":
+				if m.modalSelected >= 0 && m.modalSelected < len(m.modalEntries) {
+					e := m.modalEntries[m.modalSelected]
+					if e.IsDraft && e.DraftIdx >= 0 && e.DraftIdx < len(m.drafts) {
+						d := m.drafts[e.DraftIdx]
+						m.modalOpen = false
+						return m, m.openComposeModal(composeEditDraft, d.Path, d.Line, d.Side, e.DraftIdx, d.Body)
+					}
+				}
+				return m, nil
+			}
+			// Any other key while modal is open: swallow.
+			return m, nil
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -181,6 +395,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "3", "o":
 			m.setView(viewOverview)
 			return m, nil
+		case "4":
+			if m.prMeta == nil {
+				m.statusMsg = "4: only in PR mode"
+				return m, nil
+			}
+			m.setView(viewPR)
+			return m, nil
 		case "j", "down":
 			if m.view == viewOverview {
 				m.moveOverview(0, +1)
@@ -192,6 +413,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.focus == paneLeft {
 				return m, m.moveCursor(+1)
+			}
+			// paneDiff: move the per-line cursor (unified view) or scroll (split).
+			if m.view == viewChanges && !m.splitView && len(m.diffRows) > 0 {
+				next := nextLineRow(m.diffRows, m.diffCursor)
+				if next != m.diffCursor {
+					m.diffCursor = next
+					m.ensureCursorVisible()
+					m.rerenderDiffCursor()
+					return m, m.scheduleContextRefresh()
+				}
+				return m, nil
 			}
 			m.viewport.ScrollDown(1)
 			return m, m.maybeScheduleHunkChange()
@@ -206,6 +438,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.focus == paneLeft {
 				return m, m.moveCursor(-1)
+			}
+			if m.view == viewChanges && !m.splitView && len(m.diffRows) > 0 {
+				prev := prevLineRow(m.diffRows, m.diffCursor)
+				if prev != m.diffCursor {
+					m.diffCursor = prev
+					m.ensureCursorVisible()
+					m.rerenderDiffCursor()
+					return m, m.scheduleContextRefresh()
+				}
+				return m, nil
 			}
 			m.viewport.ScrollUp(1)
 			return m, m.maybeScheduleHunkChange()
@@ -274,6 +516,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.toggleDirCollapsed(r.Path)
 					return m, nil
 				}
+				if r.Kind == rowFile {
+					m.focus = paneDiff
+					return m, nil
+				}
 			}
 			return m, nil
 		case "g":
@@ -331,6 +577,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "browser: " + err.Error()
 			}
 			return m, nil
+		case "C":
+			if m.prMeta == nil {
+				return m, nil
+			}
+			if m.view != viewChanges {
+				m.statusMsg = "C: switch to changes view first"
+				return m, nil
+			}
+			fr, _, ok := m.currentFileRow()
+			if !ok {
+				m.statusMsg = "C: place cursor on a diff line first"
+				return m, nil
+			}
+			line, side := m.currentDiffAnchor()
+			if line == 0 {
+				m.statusMsg = "C: no anchor line at the cursor"
+				return m, nil
+			}
+			return m, m.openComposeModal(composeNewDraft, fr.Path, line, side, -1, "")
+		case "B":
+			if m.prMeta == nil {
+				return m, nil
+			}
+			return m, m.openComposeBodyModal(composeBody)
+		case "S":
+			if m.prMeta == nil {
+				return m, nil
+			}
+			if m.submitter == nil {
+				m.statusMsg = "S: submit unavailable (auth failed at startup)"
+				return m, nil
+			}
+			if len(m.drafts) == 0 {
+				m.statusMsg = "S: no drafts to submit"
+				return m, nil
+			}
+			return m, m.openComposeBodyModal(composeSubmit)
+		case "t":
+			if m.prMeta == nil || m.view != viewChanges {
+				return m, nil
+			}
+			fr, _, ok := m.currentFileRow()
+			if !ok {
+				return m, nil
+			}
+			line, side := m.currentDiffAnchor()
+			if line == 0 {
+				return m, nil
+			}
+			entries := buildThread(m.reviewComments, m.drafts, fr.Path, line, side)
+			if len(entries) == 0 {
+				return m, nil
+			}
+			m.modalOpen = true
+			m.modalEntries = entries
+			m.modalSelected = 0
+			m.modalAnchor = modalAnchor{Path: fr.Path, Line: line, Side: side}
+			return m, nil
 		case "s":
 			if m.view == viewChanges {
 				m.splitView = !m.splitView
@@ -347,9 +651,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.contextHistoryExpanded = !m.contextHistoryExpanded
 			return m, m.scheduleContextRefresh()
+		case "r":
+			if m.refetcher == nil {
+				m.statusMsg = "r: refresh only available in PR mode"
+				return m, nil
+			}
+			m.statusMsg = "refreshing comments…"
+			return m, m.runRefetch()
 		case "esc":
 			if m.focus == paneContext {
 				m.focus = paneDiff
+				return m, nil
+			}
+			if m.focus == paneDiff {
+				m.focus = paneLeft
 				return m, nil
 			}
 			return m, nil
@@ -363,16 +678,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case submitDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = "submit failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.drafts = nil
+		m.reviewBody = ""
+		m.statusMsg = fmt.Sprintf("submitted %d %s", msg.n, plural("comment", msg.n))
+		if m.refetcher != nil {
+			return m, m.runRefetch()
+		}
+		return m, m.scheduleContextRefresh()
+
+	case refetchDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = "refetch: " + msg.err.Error()
+			return m, m.scheduleContextRefresh()
+		}
+		if msg.res != nil {
+			m.reviewComments = msg.res.ReviewComments
+			m.issueComments = msg.res.IssueComments
+			m.reviews = msg.res.Reviews
+		}
+		if m.statusMsg == "refreshing comments…" {
+			m.statusMsg = "refreshed"
+		}
+		return m, m.scheduleContextRefresh()
+
 	case contextRefreshMsg:
 		if msg.Seq != m.contextRefreshSeq {
 			return m, nil // stale
 		}
+		anchorLine, anchorSide := m.currentDiffAnchor()
 		cur := ctxpane.Cursor{
 			File:            m.currentFileForContext(),
 			HunkIndex:       m.currentHunkIndex(),
 			Diff:            m.d,
 			RepoRoot:        m.repoRoot,
 			HistoryExpanded: m.contextHistoryExpanded,
+			ReviewComments:  m.reviewComments,
+			Drafts:          m.drafts,
+			CurrentLine:     anchorLine,
+			CurrentSide:     anchorSide,
 		}
 		m.contextCursor = cur
 		seq := msg.Seq
@@ -410,6 +758,214 @@ func openBrowser(url string) error {
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
 	return cmd.Start()
+}
+
+// composeDraft spawns $EDITOR on an empty temp file. On editor exit, the
+// file contents (after stripping #-comment lines + trimming) become the
+// draft body. Empty bodies are dropped without state change.
+// openComposeBodyModal shows the modal for composing the review body
+// (kind=composeBody) or composing-then-submitting (kind=composeSubmit).
+// The textarea seeds with whatever is currently in m.reviewBody.
+func (m *Model) openComposeBodyModal(kind composeKind) tea.Cmd {
+	ta := textarea.New()
+	if kind == composeSubmit {
+		ta.Placeholder = "Optional review summary…"
+	} else {
+		ta.Placeholder = "Your review summary…"
+	}
+	ta.CharLimit = 64 * 1024
+	ta.SetValue(m.reviewBody)
+	ta.ShowLineNumbers = false
+	cmd := ta.Focus()
+	m.composeArea = ta
+	m.composeOpen = true
+	m.composeKind = kind
+	m.composePath = ""
+	m.composeLine = 0
+	m.composeSide = ""
+	m.composeEditIdx = -1
+	m.composeFromMod = false
+	return cmd
+}
+
+// openComposeModal initialises and shows the in-TUI textarea for composing
+// or editing a single inline comment. When called from inside the thread
+// modal (editDraft path), composeFromMod is set so the thread modal
+// re-opens automatically after save/cancel. initialBody seeds the textarea
+// for edits; empty for new drafts.
+func (m *Model) openComposeModal(kind composeKind, path string, line int, side string, editIdx int, initialBody string) tea.Cmd {
+	ta := textarea.New()
+	ta.Placeholder = "Write your comment…"
+	ta.CharLimit = 64 * 1024
+	ta.SetValue(initialBody)
+	ta.ShowLineNumbers = false
+	// Size set in View() where m.width/m.height are known.
+	cmd := ta.Focus()
+	m.composeArea = ta
+	m.composeOpen = true
+	m.composeKind = kind
+	m.composePath = path
+	m.composeLine = line
+	m.composeSide = side
+	m.composeEditIdx = editIdx
+	m.composeFromMod = (kind == composeEditDraft)
+	return cmd
+}
+
+// stripDraftComments removes lines starting with # and trims surrounding space.
+func stripDraftComments(s string) string {
+	var keep []string
+	for _, ln := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
+			continue
+		}
+		keep = append(keep, ln)
+	}
+	return strings.TrimSpace(strings.Join(keep, "\n"))
+}
+
+// doSubmit returns a Cmd that POSTs the review via the configured submitter.
+// Called from the compose-modal Ctrl+s handler when kind == composeSubmit.
+// Drafts are snapshotted up front so any later UI mutation can't race with
+// the in-flight POST.
+func (m *Model) doSubmit(body string) tea.Cmd {
+	draftsSnap := make([]pr.SubmitDraft, len(m.drafts))
+	for i, d := range m.drafts {
+		draftsSnap[i] = pr.SubmitDraft{Path: d.Path, Line: d.Line, Side: d.Side, Body: d.Body}
+	}
+	submitter := m.submitter
+	return func() tea.Msg {
+		if err := submitter(context.Background(), body, draftsSnap); err != nil {
+			return submitDoneMsg{err: err}
+		}
+		return submitDoneMsg{n: len(draftsSnap)}
+	}
+}
+
+type submitDoneMsg struct {
+	n   int
+	err error
+}
+
+// firstLineRow returns the first index in rows whose IsLine is true, or 0
+// when no line rows exist.
+func firstLineRow(rows []diffRow) int {
+	for i, r := range rows {
+		if r.IsLine {
+			return i
+		}
+	}
+	return 0
+}
+
+// nextLineRow / prevLineRow walk rows looking for the next/prev IsLine
+// entry; stops at the bounds (clamps).
+func nextLineRow(rows []diffRow, from int) int {
+	for i := from + 1; i < len(rows); i++ {
+		if rows[i].IsLine {
+			return i
+		}
+	}
+	return from
+}
+
+func prevLineRow(rows []diffRow, from int) int {
+	for i := from - 1; i >= 0; i-- {
+		if rows[i].IsLine {
+			return i
+		}
+	}
+	return from
+}
+
+// commentedLineMap collapses m.reviewComments + m.drafts into a set of
+// (path, line, side) keys for the diff renderer to mark.
+func (m Model) commentedLineMap() map[diffLineKey]bool {
+	if len(m.reviewComments) == 0 && len(m.drafts) == 0 {
+		return nil
+	}
+	out := make(map[diffLineKey]bool, len(m.reviewComments)+len(m.drafts))
+	for _, c := range m.reviewComments {
+		out[diffLineKey{Path: c.Path, Line: c.Line, Side: c.Side}] = true
+	}
+	for _, d := range m.drafts {
+		out[diffLineKey{Path: d.Path, Line: d.Line, Side: d.Side}] = true
+	}
+	return out
+}
+
+// rerenderDiffCursor re-renders the current file with the updated diffCursor
+// highlight in place. Cheaper than a full refreshDiff because tree/state
+// don't change.
+func (m *Model) rerenderDiffCursor() {
+	if m.view != viewChanges || m.splitView {
+		return
+	}
+	fr, _, ok := m.currentFileRow()
+	if !ok {
+		return
+	}
+	m.viewport.SetContent(renderDiff(fr, m.viewport.Width, diffRenderOpts{
+		CursorRow: m.diffCursor,
+		Commented: m.commentedLineMap(),
+	}))
+}
+
+// currentDiffAnchor returns the (line, side) of the row under the diff
+// cursor, or (0, "") when the cursor is not on a valid line row.
+func (m Model) currentDiffAnchor() (int, string) {
+	if m.diffCursor < 0 || m.diffCursor >= len(m.diffRows) {
+		return 0, ""
+	}
+	r := m.diffRows[m.diffCursor]
+	if !r.IsLine {
+		return 0, ""
+	}
+	return r.Line, r.Side
+}
+
+// ensureCursorVisible nudges the viewport's YOffset so the diff cursor row
+// is on-screen. Called after diffCursor moves.
+func (m *Model) ensureCursorVisible() {
+	if m.viewport.Height <= 0 {
+		return
+	}
+	top := m.viewport.YOffset
+	bot := top + m.viewport.Height - 1
+	if m.diffCursor < top {
+		m.viewport.SetYOffset(m.diffCursor)
+	} else if m.diffCursor > bot {
+		m.viewport.SetYOffset(m.diffCursor - m.viewport.Height + 1)
+	}
+}
+
+// runRefetch kicks off the configured refetcher in a Cmd; result delivers
+// as refetchDoneMsg.
+func (m *Model) runRefetch() tea.Cmd {
+	refetch := m.refetcher
+	return func() tea.Msg {
+		res, err := refetch(context.Background())
+		return refetchDoneMsg{res: res, err: err}
+	}
+}
+
+type refetchDoneMsg struct {
+	res *RefetcherResult
+	err error
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (m *Model) openInEditor() tea.Cmd {
@@ -482,16 +1038,202 @@ func (m Model) View() string {
 	}
 	header := m.renderTopHeader()
 	var body string
-	if m.view == viewOverview {
+	switch m.view {
+	case viewOverview:
 		body = m.renderOverviewBody()
-	} else {
+	case viewPR:
+		body = m.renderPRTabBody()
+	default:
 		parts := []string{m.renderLeftPane(), m.renderDiffPane()}
 		if m.contextPaneWidthEffective() > 0 {
 			parts = append(parts, m.renderContextPane())
 		}
 		body = lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderHelp())
+	view := lipgloss.JoinVertical(lipgloss.Left, header, body, m.renderHelp())
+	if m.composeOpen {
+		view = m.renderComposeOverlay()
+	} else if m.modalOpen {
+		modalW := minInt(m.width-4, 80)
+		innerW := modalW - 6
+		title := fmt.Sprintf("Thread: %s:%d", m.modalAnchor.Path, m.modalAnchor.Line)
+		content := renderThreadModal(title, m.modalEntries, m.modalSelected, innerW)
+		modal := modalStyle.Width(modalW).Render(content)
+		view = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+			lipgloss.WithWhitespaceChars(" "))
+	}
+	return view
+}
+
+// renderComposeOverlay draws the in-TUI compose modal. Layout adapts to
+// the composeKind: inline-comment modals show the diff context around the
+// anchor; review-body and submit modals show a header/draft summary.
+func (m Model) renderComposeOverlay() string {
+	modalW := minInt(m.width-4, 90)
+	innerW := modalW - 6
+
+	var b strings.Builder
+	title, helpHint := composeModalChrome(m.composeKind, m.composePath, m.composeLine, m.composeSide, len(m.drafts))
+	fmt.Fprintf(&b, "%s\n\n", titleStyle.Render(title))
+
+	// Context block depends on kind:
+	//   inline: diff lines around anchor
+	//   submit: draft summary
+	//   body:   short tagline
+	switch m.composeKind {
+	case composeNewDraft, composeEditDraft:
+		if fr, ok := m.fileByPath(m.composePath); ok {
+			ctx := composeContextBlock(fr, m.composeLine, m.composeSide, innerW)
+			if ctx != "" {
+				b.WriteString(ctx)
+				b.WriteString("\n\n")
+			}
+		}
+	case composeSubmit:
+		b.WriteString(submitDraftsSummary(m.drafts, innerW))
+		b.WriteString("\n\n")
+	case composeBody:
+		b.WriteString(mutedStyle.Render("This text accompanies your drafts when you press S."))
+		b.WriteString("\n\n")
+	}
+
+	// Size the textarea: take up remaining vertical room, capped.
+	taH := 8
+	if m.height > 0 {
+		avail := m.height - 16
+		if avail > taH {
+			taH = minInt(avail, 18)
+		}
+	}
+	m.composeArea.SetWidth(innerW - 2)
+	m.composeArea.SetHeight(taH)
+	b.WriteString(m.composeArea.View())
+	b.WriteString("\n\n")
+	b.WriteString(mutedStyle.Render(helpHint))
+
+	modal := modalStyle.Width(modalW).Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+		lipgloss.WithWhitespaceChars(" "))
+}
+
+// composeModalChrome returns the title + help-line hint for each kind.
+func composeModalChrome(kind composeKind, path string, line int, side string, draftCount int) (title, help string) {
+	switch kind {
+	case composeNewDraft:
+		return fmt.Sprintf("Comment on %s:%d (%s side)", path, line, side),
+			" Ctrl+s save · Esc cancel"
+	case composeEditDraft:
+		return fmt.Sprintf("Edit on %s:%d (%s side)", path, line, side),
+			" Ctrl+s save · Esc cancel · empty save = delete"
+	case composeBody:
+		return "Review body", " Ctrl+s save · Esc cancel"
+	case composeSubmit:
+		return fmt.Sprintf("Submit review (%d inline %s)", draftCount, plural("comment", draftCount)),
+			" Ctrl+s submit · Esc cancel"
+	}
+	return "Compose", " Ctrl+s save · Esc cancel"
+}
+
+// submitDraftsSummary renders the bullet list of pending drafts shown above
+// the textarea in the submit modal.
+func submitDraftsSummary(drafts []ctxpane.Draft, width int) string {
+	var b strings.Builder
+	b.WriteString(mutedStyle.Render(fmt.Sprintf("%d %s will be posted:", len(drafts), plural("draft", len(drafts)))))
+	b.WriteString("\n")
+	for _, d := range drafts {
+		snippet := strings.Join(strings.Fields(d.Body), " ")
+		row := fmt.Sprintf("  %s:%d  %q", d.Path, d.Line, snippet)
+		if len(row) > width {
+			row = row[:width-1] + "…"
+		}
+		b.WriteString(mutedStyle.Render(row))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// fileByPath returns the diff.File matching path, scanning the current diff.
+func (m Model) fileByPath(path string) (diff.File, bool) {
+	if m.d == nil {
+		return diff.File{}, false
+	}
+	for _, f := range m.d.Files {
+		if f.Path == path {
+			return f, true
+		}
+	}
+	return diff.File{}, false
+}
+
+// composeContextBlock renders ~6 diff lines around the anchor as plain styled
+// text (with > marking the cursor line). Width-truncated.
+func composeContextBlock(f diff.File, line int, side string, width int) string {
+	type entry struct {
+		prefix   string
+		num      int
+		text     string
+		isAnchor bool
+	}
+	var entries []entry
+	for _, h := range f.Hunks {
+		for _, l := range h.Lines {
+			prefix := " "
+			num := l.NewNum
+			switch l.Kind {
+			case diff.LineAdded:
+				prefix = "+"
+			case diff.LineRemoved:
+				prefix = "-"
+				num = l.OldNum
+			}
+			anchor := false
+			if side == "RIGHT" && l.Kind != diff.LineRemoved && l.NewNum == line {
+				anchor = true
+			} else if side == "LEFT" && l.Kind != diff.LineAdded && l.OldNum == line {
+				anchor = true
+			}
+			entries = append(entries, entry{prefix, num, l.Content, anchor})
+		}
+	}
+	anchorIdx := -1
+	for i, e := range entries {
+		if e.isAnchor {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx < 0 {
+		return ""
+	}
+	start := anchorIdx - 3
+	if start < 0 {
+		start = 0
+	}
+	end := anchorIdx + 4
+	if end > len(entries) {
+		end = len(entries)
+	}
+	var b strings.Builder
+	b.WriteString(mutedStyle.Render("context:"))
+	b.WriteString("\n")
+	for i := start; i < end; i++ {
+		e := entries[i]
+		marker := " "
+		if i == anchorIdx {
+			marker = ">"
+		}
+		row := fmt.Sprintf("%s  %s %4d  %s", marker, e.prefix, e.num, e.text)
+		if len(row) > width {
+			row = row[:width]
+		}
+		if i == anchorIdx {
+			b.WriteString(prHeaderStyle.Render(row))
+		} else {
+			b.WriteString(mutedStyle.Render(row))
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // renderTopHeader is a single-line strip showing the three view tabs and PR
@@ -521,6 +1263,9 @@ func (m Model) renderTabsGlobal() string {
 		style(m.view == viewChanges).Render("[1 changes]"),
 		style(m.view == viewCommits).Render("[2 commits]"),
 		style(m.view == viewOverview).Render("[3 overview]"),
+	}
+	if m.prMeta != nil {
+		parts = append(parts, style(m.view == viewPR).Render("[4 PR]"))
 	}
 	return strings.Join(parts, " ")
 }
@@ -709,25 +1454,36 @@ func (m *Model) jumpHunk(dir int) {
 		return
 	}
 	cur := m.viewport.YOffset
+	target := m.viewport.YOffset
 	if dir > 0 {
+		target = m.hunkOffsets[len(m.hunkOffsets)-1]
 		for _, off := range m.hunkOffsets {
 			if off > cur {
-				m.viewport.SetYOffset(off)
+				target = off
+				break
+			}
+		}
+	} else {
+		target = m.hunkOffsets[0]
+		for _, off := range m.hunkOffsets {
+			if off >= cur {
+				break
+			}
+			target = off
+		}
+	}
+	m.viewport.SetYOffset(target)
+	// Snap the per-line cursor to the first line row of the target hunk
+	// so the highlight stays in sync with what's on screen.
+	if m.view == viewChanges && !m.splitView && len(m.diffRows) > 0 {
+		for i := target; i < len(m.diffRows); i++ {
+			if m.diffRows[i].IsLine {
+				m.diffCursor = i
+				m.rerenderDiffCursor()
 				return
 			}
 		}
-		// already past last hunk — go to last
-		m.viewport.SetYOffset(m.hunkOffsets[len(m.hunkOffsets)-1])
-		return
 	}
-	target := m.hunkOffsets[0]
-	for _, off := range m.hunkOffsets {
-		if off >= cur {
-			break
-		}
-		target = off
-	}
-	m.viewport.SetYOffset(target)
 }
 
 // --- mode + cursor helpers ---
@@ -751,6 +1507,10 @@ func (m *Model) setView(v viewMode) {
 			m.statusMsg = "no files to overview"
 			return
 		}
+	}
+	if v == viewPR && m.prMeta == nil {
+		m.statusMsg = "no PR loaded"
+		return
 	}
 	if v == m.view {
 		return
@@ -1153,8 +1913,16 @@ func (m *Model) refreshDiff() {
 		if m.splitView {
 			m.viewport.SetContent(renderSplit(fr, m.viewport.Width))
 			m.hunkOffsets = hunkOffsetsSplit(fr)
+			m.diffRows = nil
 		} else {
-			m.viewport.SetContent(renderDiff(fr, m.viewport.Width))
+			m.diffRows = buildDiffRows(fr)
+			if m.diffCursor < 0 || m.diffCursor >= len(m.diffRows) || !m.diffRows[m.diffCursor].IsLine {
+				m.diffCursor = firstLineRow(m.diffRows)
+			}
+			m.viewport.SetContent(renderDiff(fr, m.viewport.Width, diffRenderOpts{
+				CursorRow: m.diffCursor,
+				Commented: m.commentedLineMap(),
+			}))
 			m.hunkOffsets = hunkOffsetsUnified(fr)
 		}
 	} else {
@@ -1523,6 +2291,9 @@ func (m Model) renderHelp() string {
 		parts = append([]string{"c clear-filter"}, parts...)
 	} else {
 		parts = append(parts, "c ctx")
+	}
+	if m.prMeta != nil {
+		parts = append(parts, "C: comment", "S: submit", "t: thread", "B: body", "O: browser")
 	}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {

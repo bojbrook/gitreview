@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -267,6 +268,81 @@ func TestContextFocusSkipsHiddenPane(t *testing.T) {
 	}
 }
 
+func TestRKeyWithoutRefetcherShowsHint(t *testing.T) {
+	m := New(fakeDiff(), nil, "", nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+	if m.statusMsg != "r: refresh only available in PR mode" {
+		t.Errorf("status: got %q", m.statusMsg)
+	}
+}
+
+func TestRKeyTriggersRefetchAndAppliesResult(t *testing.T) {
+	m := New(fakeDiff(), nil, "", nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	stub := &RefetcherResult{
+		ReviewComments: []ctxpane.CommentRef{{User: "alice", Body: "hi"}},
+	}
+	m.refetcher = func(ctx context.Context) (*RefetcherResult, error) {
+		return stub, nil
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+	if m.statusMsg != "refreshing comments…" {
+		t.Errorf("status during refresh: got %q", m.statusMsg)
+	}
+	if cmd == nil {
+		t.Fatal("expected refetch Cmd")
+	}
+	msg := cmd()
+	updated, _ = m.Update(msg)
+	m = updated.(Model)
+	if len(m.reviewComments) != 1 || m.reviewComments[0].User != "alice" {
+		t.Errorf("reviewComments not applied: got %+v", m.reviewComments)
+	}
+	if m.statusMsg != "refreshed" {
+		t.Errorf("status after refresh: got %q", m.statusMsg)
+	}
+}
+
+func TestEnterOnFileFocusesDiff(t *testing.T) {
+	m := New(fakeDiff(), nil, "", nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Fatalf("setup: initial focus should be paneLeft, got %v", m.focus)
+	}
+	// Move cursor to a file row (row 0 is the root dir; row 1 is the first file).
+	m.rowCursor = 1
+	if r := m.rowAtCursor(); r.Kind != rowFile {
+		t.Fatalf("setup: row 1 should be a file, got kind=%v", r.Kind)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Errorf("after enter on file: got %v want paneDiff", m.focus)
+	}
+}
+
+func TestEscFromDiffReturnsToLeft(t *testing.T) {
+	m := New(fakeDiff(), nil, "", nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.focus != paneDiff {
+		t.Fatalf("setup: focus should be paneDiff, got %v", m.focus)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.focus != paneLeft {
+		t.Errorf("after esc from diff: got %v want paneLeft", m.focus)
+	}
+}
+
 func TestContextEscReturnsFocusToDiff(t *testing.T) {
 	m := New(fakeDiff(), nil, "", nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
@@ -470,7 +546,7 @@ func TestPRModeHeader(t *testing.T) {
 		State:   "open",
 		HTMLURL: "https://github.com/foo/bar/pull/42",
 	}
-	m := New(fakeDiff(), nil, "", meta)
+	m := New(fakeDiff(), nil, "", &PRBundle{Meta: meta})
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
 	m = updated.(Model)
 	out := m.View()
