@@ -17,8 +17,8 @@ type Commit struct {
 	Parents  []string
 }
 
-func (c Commit) IsRoot() bool   { return len(c.Parents) == 0 }
-func (c Commit) IsMerge() bool  { return len(c.Parents) > 1 }
+func (c Commit) IsRoot() bool  { return len(c.Parents) == 0 }
+func (c Commit) IsMerge() bool { return len(c.Parents) > 1 }
 
 // LoadCommits returns up to limit commits reachable from HEAD, most recent first.
 // Returns an empty slice if the repo has no HEAD yet (not an error).
