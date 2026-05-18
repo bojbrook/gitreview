@@ -516,6 +516,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.toggleDirCollapsed(r.Path)
 					return m, nil
 				}
+				if r.Kind == rowFile {
+					m.focus = paneDiff
+					return m, nil
+				}
 			}
 			return m, nil
 		case "g":
@@ -650,6 +654,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			if m.focus == paneContext {
 				m.focus = paneDiff
+				return m, nil
+			}
+			if m.focus == paneDiff {
+				m.focus = paneLeft
 				return m, nil
 			}
 			return m, nil
