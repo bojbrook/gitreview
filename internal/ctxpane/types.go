@@ -96,12 +96,13 @@ type Cursor struct {
 // package's ReviewComment maps directly to this — kept here so ctxpane has
 // no import on pr.
 type CommentRef struct {
-	User string
-	Path string
-	Line int
-	Side string // "RIGHT" | "LEFT"
-	Body string
-	Age  string // pre-formatted relative time ("2h ago")
+	User      string
+	Path      string
+	Line      int
+	Side      string // "RIGHT" | "LEFT"
+	Body      string
+	Age       string // pre-formatted relative time ("2h ago")
+	CreatedAt int64  // unix seconds; used to sort comments chronologically across kinds
 }
 
 // Draft is a locally-authored comment not yet submitted to GitHub.
@@ -116,16 +117,18 @@ type Draft struct {
 // IssueComment / Review. ctxpane has no import on pr; the wiring layer
 // (cmd/gitreview/main.go) maps the wire types into these.
 type IssueCommentDisplay struct {
-	User string
-	Age  string
-	Body string
+	User      string
+	Age       string
+	Body      string
+	CreatedAt int64
 }
 
 type ReviewDisplay struct {
-	User  string
-	State string // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
-	Age   string
-	Body  string
+	User      string
+	State     string // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+	Age       string
+	Body      string
+	CreatedAt int64
 }
 
 // AnchorLine returns the OldNum (for removed lines) or NewNum (otherwise)

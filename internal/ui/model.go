@@ -37,6 +37,7 @@ const (
 	viewCommits
 	viewOverview
 	viewPR
+	viewComments
 )
 
 type Model struct {
@@ -100,6 +101,12 @@ type Model struct {
 	modalEntries  []threadEntry
 	modalSelected int
 	modalAnchor   modalAnchor
+
+	// [5 comments] tab state. commentsCursor indexes into the unified comment
+	// list rebuilt on each render; commentsDetailFocused flips with tab so
+	// long detail bodies could be scrolled (no scrolling yet — flag reserved).
+	commentsCursor        int
+	commentsDetailFocused bool
 
 	// Compose modal state — in-TUI textarea for C / e (inline drafts).
 	composeOpen    bool
@@ -191,6 +198,75 @@ func (m Model) renderPRTabBody() string {
 	content := renderPRTabBody(m.prMeta, m.issueComments, m.reviews, len(m.drafts), m.reviewBody, innerW)
 	bodyH := m.height - headerRows - helpHeight - 2
 	return paneStyle.Width(m.width - 2).Height(bodyH).Render(content)
+}
+
+// renderCommentsBody renders the [5 comments] tab — a two-pane list + detail
+// view of every PR comment plus the user's local drafts.
+func (m Model) renderCommentsBody() string {
+	items := m.commentsItems()
+	var files []diff.File
+	if m.d != nil {
+		files = m.d.Files
+	}
+	bodyH := m.height - headerRows - helpHeight
+	return renderCommentsTab(items, m.commentsCursor, files, m.width, bodyH, !m.commentsDetailFocused)
+}
+
+// commentsItems returns the merged + chronologically-sorted comment list for
+// the [5 comments] tab. Rebuilt on demand so it always reflects current drafts.
+func (m Model) commentsItems() []unifiedComment {
+	return unifyComments(m.reviewComments, m.issueComments, m.reviews, m.drafts)
+}
+
+func (m *Model) moveCommentsCursor(delta int) {
+	n := len(m.commentsItems())
+	if n == 0 {
+		m.commentsCursor = 0
+		return
+	}
+	c := m.commentsCursor + delta
+	if c < 0 {
+		c = 0
+	}
+	if c > n-1 {
+		c = n - 1
+	}
+	m.commentsCursor = c
+}
+
+// commentsJump handles enter on the comments tab: for inline / draft rows,
+// switch to viewChanges and position the file/line cursor on the anchor.
+// No-op for review and issue-comment rows (they have no anchor).
+func (m *Model) commentsJump() tea.Cmd {
+	items := m.commentsItems()
+	if m.commentsCursor < 0 || m.commentsCursor >= len(items) {
+		return nil
+	}
+	c := items[m.commentsCursor]
+	if c.Path == "" || c.Line == 0 {
+		m.statusMsg = "no anchor on this comment"
+		return nil
+	}
+	m.view = viewChanges
+	m.refreshDiff() // rebuild treeRows
+	if row := RowOfFile(m.treeRows, c.Path); row >= 0 {
+		m.rowCursor = row
+	} else {
+		m.statusMsg = fmt.Sprintf("file %s not in current diff", c.Path)
+		return m.scheduleContextRefresh()
+	}
+	m.refreshDiff() // re-render diff for the new rowCursor and populate diffRows
+	// Position the per-line cursor on the anchor, if present in the diff rows.
+	for i, r := range m.diffRows {
+		if r.IsLine && r.Path == c.Path && r.Line == c.Line && r.Side == c.Side {
+			m.diffCursor = i
+			m.ensureCursorVisible()
+			m.rerenderDiffCursor()
+			break
+		}
+	}
+	m.focus = paneDiff
+	return m.scheduleContextRefresh()
 }
 
 // editorDoneMsg is dispatched when tea.ExecProcess returns from the editor.
@@ -378,9 +454,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
+			if m.view == viewComments {
+				m.commentsDetailFocused = !m.commentsDetailFocused
+				return m, nil
+			}
 			m.focus = m.nextFocus(+1)
 			return m, nil
 		case "shift+tab":
+			if m.view == viewComments {
+				m.commentsDetailFocused = !m.commentsDetailFocused
+				return m, nil
+			}
 			m.focus = m.nextFocus(-1)
 			return m, nil
 		case "v":
@@ -402,7 +486,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.setView(viewPR)
 			return m, nil
+		case "5":
+			if m.prMeta == nil {
+				m.statusMsg = "5: only in PR mode"
+				return m, nil
+			}
+			m.setView(viewComments)
+			return m, nil
 		case "j", "down":
+			if m.view == viewComments {
+				m.moveCommentsCursor(+1)
+				return m, nil
+			}
 			if m.view == viewOverview {
 				m.moveOverview(0, +1)
 				return m, m.scheduleContextRefresh()
@@ -428,6 +523,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.ScrollDown(1)
 			return m, m.maybeScheduleHunkChange()
 		case "k", "up":
+			if m.view == viewComments {
+				m.moveCommentsCursor(-1)
+				return m, nil
+			}
 			if m.view == viewOverview {
 				m.moveOverview(0, -1)
 				return m, m.scheduleContextRefresh()
@@ -493,6 +592,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "enter":
+			if m.view == viewComments {
+				return m, m.commentsJump()
+			}
 			if m.view == viewOverview {
 				files, _ := m.effectiveFiles()
 				if m.overviewCursor >= 0 && m.overviewCursor < len(files) {
@@ -1043,6 +1145,8 @@ func (m Model) View() string {
 		body = m.renderOverviewBody()
 	case viewPR:
 		body = m.renderPRTabBody()
+	case viewComments:
+		body = m.renderCommentsBody()
 	default:
 		parts := []string{m.renderLeftPane(), m.renderDiffPane()}
 		if m.contextPaneWidthEffective() > 0 {
@@ -1265,7 +1369,10 @@ func (m Model) renderTabsGlobal() string {
 		style(m.view == viewOverview).Render("[3 overview]"),
 	}
 	if m.prMeta != nil {
-		parts = append(parts, style(m.view == viewPR).Render("[4 PR]"))
+		parts = append(parts,
+			style(m.view == viewPR).Render("[4 PR]"),
+			style(m.view == viewComments).Render("[5 comments]"),
+		)
 	}
 	return strings.Join(parts, " ")
 }
@@ -1509,6 +1616,10 @@ func (m *Model) setView(v viewMode) {
 		}
 	}
 	if v == viewPR && m.prMeta == nil {
+		m.statusMsg = "no PR loaded"
+		return
+	}
+	if v == viewComments && m.prMeta == nil {
 		m.statusMsg = "no PR loaded"
 		return
 	}
@@ -2286,7 +2397,11 @@ func (m Model) renderHelp() string {
 	if m.splitView {
 		splitHint = "s: unified"
 	}
-	parts := []string{"j/k file", "]/[ hunk", "m mark", "M next-unreviewed", "/ filter", "1/2/3 tab", splitHint, "e edit", "q quit"}
+	tabHint := "1/2/3 tab"
+	if m.prMeta != nil {
+		tabHint = "1/2/3/4/5 tab"
+	}
+	parts := []string{"j/k file", "]/[ hunk", "m mark", "M next-unreviewed", "/ filter", tabHint, splitHint, "e edit", "q quit"}
 	if m.filter != "" {
 		parts = append([]string{"c clear-filter"}, parts...)
 	} else {
@@ -2294,6 +2409,9 @@ func (m Model) renderHelp() string {
 	}
 	if m.prMeta != nil {
 		parts = append(parts, "C: comment", "S: submit", "t: thread", "B: body", "O: browser")
+	}
+	if m.view == viewComments {
+		parts = []string{"j/k select", "enter jump", "tab focus", "1/2/3/4/5 tab", "q quit"}
 	}
 	hint := strings.Join(parts, "  ")
 	if m.statusMsg != "" {
