@@ -3,6 +3,7 @@ package pr
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/google/go-github/v66/github"
 )
@@ -72,23 +73,59 @@ type RefetchedComments struct {
 	Reviews        []Review
 }
 
-// NewRefetcher returns a closure that re-pulls the PR's three comment streams.
-// Errors on any stream are non-fatal: the other streams still populate and
-// the failing stream returns an empty slice. The returned error is non-nil
-// only if all three streams fail.
-func NewRefetcher(token, owner, repo string, num int) (func(ctx context.Context) (*RefetchedComments, error), error) {
+// NewRefetcher returns a closure that re-pulls the PR's three comment streams
+// in parallel, bypassing the read cache. On per-stream success, the fresh
+// result is written back to cacheDir (when non-empty) so subsequent loads
+// see the updated data. Errors on any stream are non-fatal: the other streams
+// still populate. The returned error is non-nil only when all three fail.
+func NewRefetcher(token, owner, repo string, num int, cacheDir string) (func(ctx context.Context) (*RefetchedComments, error), error) {
 	c, err := newClient(token, "")
 	if err != nil {
 		return nil, err
 	}
 	return func(ctx context.Context) (*RefetchedComments, error) {
-		out := &RefetchedComments{}
-		rcs, rcErr := fetchReviewComments(ctx, c, owner, repo, num)
-		ics, icErr := fetchIssueComments(ctx, c, owner, repo, num)
-		rvs, rvErr := fetchReviews(ctx, c, owner, repo, num)
-		out.ReviewComments = rcs
-		out.IssueComments = ics
-		out.Reviews = rvs
+		var (
+			rcs   []ReviewComment
+			ics   []IssueComment
+			rvs   []Review
+			rcErr error
+			icErr error
+			rvErr error
+		)
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			rcs, rcErr = fetchReviewComments(ctx, c, owner, repo, num)
+		}()
+		go func() {
+			defer wg.Done()
+			ics, icErr = fetchIssueComments(ctx, c, owner, repo, num)
+		}()
+		go func() {
+			defer wg.Done()
+			rvs, rvErr = fetchReviews(ctx, c, owner, repo, num)
+		}()
+		wg.Wait()
+
+		if cacheDir != "" {
+			cc := &cache{dir: cacheDir, ttl: defaultCacheTTL}
+			if rcErr == nil {
+				_ = cc.write("review-comments.json", rcs)
+			}
+			if icErr == nil {
+				_ = cc.write("issue-comments.json", ics)
+			}
+			if rvErr == nil {
+				_ = cc.write("reviews.json", rvs)
+			}
+		}
+
+		out := &RefetchedComments{
+			ReviewComments: rcs,
+			IssueComments:  ics,
+			Reviews:        rvs,
+		}
 		if rcErr != nil && icErr != nil && rvErr != nil {
 			return out, fmt.Errorf("all comment fetches failed: %v / %v / %v", rcErr, icErr, rvErr)
 		}

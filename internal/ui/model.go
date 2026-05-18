@@ -651,6 +651,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.contextHistoryExpanded = !m.contextHistoryExpanded
 			return m, m.scheduleContextRefresh()
+		case "r":
+			if m.refetcher == nil {
+				m.statusMsg = "r: refresh only available in PR mode"
+				return m, nil
+			}
+			m.statusMsg = "refreshing comments…"
+			return m, m.runRefetch()
 		case "esc":
 			if m.focus == paneContext {
 				m.focus = paneDiff
@@ -693,6 +700,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reviewComments = msg.res.ReviewComments
 			m.issueComments = msg.res.IssueComments
 			m.reviews = msg.res.Reviews
+		}
+		if m.statusMsg == "refreshing comments…" {
+			m.statusMsg = "refreshed"
 		}
 		return m, m.scheduleContextRefresh()
 

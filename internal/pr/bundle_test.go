@@ -28,7 +28,7 @@ func TestLoad_RepoMismatch(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "x") // satisfy ResolveToken
 
 	_, err := Load(context.Background(), "foo/bar#1",
-		func() (string, error) { return work, nil })
+		func() (string, error) { return work, nil }, false)
 	if err == nil {
 		t.Fatal("want error from repo-mismatch path")
 	}
@@ -44,7 +44,7 @@ func TestLoad_BareNumberWithoutRemote(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "x")
 
 	_, err := Load(context.Background(), "1",
-		func() (string, error) { return work, nil })
+		func() (string, error) { return work, nil }, false)
 	if err == nil {
 		t.Fatal("want error: no github remote to derive owner/repo")
 	}

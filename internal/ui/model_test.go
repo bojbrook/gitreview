@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -264,6 +265,46 @@ func TestContextFocusSkipsHiddenPane(t *testing.T) {
 	m = updated.(Model)
 	if m.focus != paneLeft {
 		t.Errorf("after second tab: got %v want paneLeft (pane hidden, skipped)", m.focus)
+	}
+}
+
+func TestRKeyWithoutRefetcherShowsHint(t *testing.T) {
+	m := New(fakeDiff(), nil, "", nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+	if m.statusMsg != "r: refresh only available in PR mode" {
+		t.Errorf("status: got %q", m.statusMsg)
+	}
+}
+
+func TestRKeyTriggersRefetchAndAppliesResult(t *testing.T) {
+	m := New(fakeDiff(), nil, "", nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(Model)
+	stub := &RefetcherResult{
+		ReviewComments: []ctxpane.CommentRef{{User: "alice", Body: "hi"}},
+	}
+	m.refetcher = func(ctx context.Context) (*RefetcherResult, error) {
+		return stub, nil
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+	if m.statusMsg != "refreshing comments…" {
+		t.Errorf("status during refresh: got %q", m.statusMsg)
+	}
+	if cmd == nil {
+		t.Fatal("expected refetch Cmd")
+	}
+	msg := cmd()
+	updated, _ = m.Update(msg)
+	m = updated.(Model)
+	if len(m.reviewComments) != 1 || m.reviewComments[0].User != "alice" {
+		t.Errorf("reviewComments not applied: got %+v", m.reviewComments)
+	}
+	if m.statusMsg != "refreshed" {
+		t.Errorf("status after refresh: got %q", m.statusMsg)
 	}
 }
 

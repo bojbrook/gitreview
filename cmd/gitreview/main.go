@@ -69,6 +69,7 @@ func runPreflightMode() {
 func runPRMode(args []string) {
 	fs := flag.NewFlagSet("pr", flag.ExitOnError)
 	width := fs.Int("width", 0, "force terminal width")
+	refresh := fs.Bool("refresh", false, "bypass on-disk cache and refetch all PR data from GitHub")
 	fs.Parse(args)
 	if fs.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "gitreview pr: missing PR ref (e.g. `gitreview pr 1234`)")
@@ -76,7 +77,7 @@ func runPRMode(args []string) {
 	}
 	ctx := context.Background()
 
-	bundle, err := pr.Load(ctx, fs.Arg(0), diff.RepoRoot)
+	bundle, err := pr.Load(ctx, fs.Arg(0), diff.RepoRoot, *refresh)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gitreview:", err)
 		os.Exit(1)
@@ -131,7 +132,7 @@ func runPRMode(args []string) {
 		} else {
 			submitter = s
 		}
-		if rf, rErr := pr.NewRefetcher(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number); rErr != nil {
+		if rf, rErr := pr.NewRefetcher(submitToken, bundle.Meta.Owner, bundle.Meta.Repo, bundle.Meta.Number, bundle.CacheDir); rErr != nil {
 			fmt.Fprintln(os.Stderr, "gitreview: warn: refetch disabled:", rErr)
 		} else {
 			refetcher = func(ctx context.Context) (*ui.RefetcherResult, error) {
